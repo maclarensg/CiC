@@ -158,6 +158,10 @@ class CiCClient:
     ) -> ChatResult:
         """Send a synchronous chat request via the claude CLI.
 
+        This method blocks until the claude subprocess completes. It must
+        not be called from within a running event loop — use ``achat()``
+        instead in async code (e.g. inside FastAPI handlers or Jupyter notebooks).
+
         Args:
             messages: OpenAI-format messages list. Must contain at least one
                 message with ``role: "user"``.
@@ -172,7 +176,20 @@ class CiCClient:
             ClaudeNotFoundError: If the claude CLI is not available.
             ClaudeTimeoutError: If the subprocess times out.
             ClaudeSubprocessError: If the CLI returns an error response.
+            RuntimeError: If called from within an already-running event loop.
+                Use ``achat()`` in async contexts.
         """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            raise RuntimeError(
+                "CiCClient.chat() cannot be called from within a running event loop. "
+                "Use 'await client.achat(...)' instead."
+            )
+
         return asyncio.run(self.achat(messages, tools=tools))
 
     def chat_openai_format(
@@ -209,7 +226,8 @@ class CiCClient:
         """Send an async chat request via the claude CLI.
 
         Prefer this method in async code — it avoids the ``asyncio.run()``
-        overhead of the sync ``chat()`` wrapper.
+        overhead of the sync ``chat()`` wrapper and works correctly inside
+        running event loops (FastAPI, Jupyter, etc.).
 
         Args:
             messages: OpenAI-format messages list.
@@ -399,21 +417,24 @@ def _build_chat_result(
     )
 
 
-def _parse_arguments(arguments: str | dict[str, Any]) -> dict[str, Any]:
+def _parse_arguments(arguments: str | dict[str, Any] | Any) -> dict[str, Any]:
     """Parse tool call arguments into a dict.
 
     OpenAI format stores arguments as a JSON string; we materialise it.
 
     Args:
-        arguments: Either a JSON string or an already-parsed dict.
+        arguments: Either a JSON string, an already-parsed dict, or any other
+            value (treated as empty arguments).
 
     Returns:
         A dict of argument name → value.
     """
     if isinstance(arguments, dict):
         return arguments
+    if not isinstance(arguments, str):
+        return {}
     try:
         parsed = json.loads(arguments)
         return parsed if isinstance(parsed, dict) else {}
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError:
         return {}

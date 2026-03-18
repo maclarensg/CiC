@@ -368,3 +368,24 @@ class TestParseArguments:
 
     def test_json_non_dict_returns_empty(self):
         assert _parse_arguments("[1, 2, 3]") == {}
+
+
+# ---------------------------------------------------------------------------
+# chat() event loop guard
+# ---------------------------------------------------------------------------
+
+class TestSyncChatEventLoopGuard:
+    @pytest.mark.asyncio
+    async def test_chat_raises_when_called_inside_event_loop(self):
+        """chat() must raise RuntimeError when called from an already-running loop."""
+        client = _make_client(model="sonnet")
+        with pytest.raises(RuntimeError, match="event loop"):
+            client.chat([{"role": "user", "content": "hi"}])
+
+    @pytest.mark.asyncio
+    async def test_achat_works_inside_event_loop(self):
+        """achat() is the correct method to use inside an async context."""
+        client = _make_client(model="sonnet")
+        client._spawn_claude = _mock_spawn(_text_response("async works"))
+        result = await client.achat([{"role": "user", "content": "hi"}])
+        assert result.content == "async works"

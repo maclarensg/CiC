@@ -34,7 +34,17 @@ With tools (agent loop)::
     while result.has_tool_calls:
         for tc in result.tool_calls:
             output = your_tool_executor(tc.name, tc.arguments)
-            messages.append({"role": "assistant", "content": None, "tool_calls": [tc.id]})
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": tc.arguments_json()},
+                    }
+                ],
+            })
             messages.append({"role": "tool", "name": tc.name, "content": output})
         result = client.chat(messages, tools=tools)
 

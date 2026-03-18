@@ -10,6 +10,8 @@ import json
 import re
 from typing import Any
 
+from .exceptions import ClaudeSubprocessError, ResponseParseError
+
 # System prompt injected at the top of every CiC call.
 # Instructs the model to respond with exactly one JSON object.
 _SYSTEM_PROMPT = """\
@@ -114,7 +116,7 @@ def _format_messages(messages: list[dict[str, Any]]) -> str:
 
     for msg in messages:
         role = msg.get("role", "")
-        content = msg.get("content", "")
+        content = msg.get("content") or ""
 
         if role == "system":
             text = _extract_text(content)
@@ -123,7 +125,8 @@ def _format_messages(messages: list[dict[str, Any]]) -> str:
 
         elif role == "user":
             text = _extract_text(content)
-            parts.append(f"[User]: {text}")
+            if text:
+                parts.append(f"[User]: {text}")
 
         elif role == "assistant":
             tool_calls = msg.get("tool_calls", [])
@@ -194,9 +197,6 @@ def parse_cli_output(stdout: str) -> dict[str, Any]:
         ResponseParseError: If the envelope cannot be parsed.
         ClaudeSubprocessError: If ``is_error`` is True in the envelope.
     """
-    # Import here to avoid circular at module level (utils imported by client)
-    from .exceptions import ClaudeSubprocessError, ResponseParseError
-
     stdout = stdout.strip()
     if not stdout:
         return _make_content_response("[CiC] No output from claude subprocess")

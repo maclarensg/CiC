@@ -320,3 +320,90 @@ class TestHelpers:
 
     def test_extract_empty_when_no_choices(self):
         assert extract_response_text({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# Edge cases: empty inputs and boundary conditions
+# ---------------------------------------------------------------------------
+
+class TestBuildPromptEdgeCases:
+    def test_empty_messages_list(self):
+        """Empty messages list produces a valid prompt with no conversation lines."""
+        prompt = build_prompt([], tools=None)
+        assert "CONVERSATION HISTORY:" in prompt
+        # No user/assistant lines, but the prompt itself is valid
+        assert "[User]:" not in prompt
+
+    def test_empty_tools_list_treated_as_no_tools(self):
+        """tools=[] should not add the AVAILABLE TOOLS section."""
+        prompt = build_prompt([{"role": "user", "content": "hi"}], tools=[])
+        assert "AVAILABLE TOOLS" not in prompt
+
+    def test_user_message_with_empty_content_omitted(self):
+        """A user message with empty string content should not appear in the prompt."""
+        messages = [
+            {"role": "user", "content": ""},
+            {"role": "user", "content": "real message"},
+        ]
+        prompt = build_prompt(messages, tools=None)
+        # Only the non-empty user message appears
+        assert prompt.count("[User]:") == 1
+        assert "real message" in prompt
+
+    def test_user_message_with_none_content_omitted(self):
+        """A user message with None content should not appear in the prompt."""
+        messages = [{"role": "user", "content": None}]
+        prompt = build_prompt(messages, tools=None)
+        assert "[User]:" not in prompt
+
+    def test_very_long_prompt(self):
+        """Prompt building handles 100K+ character inputs without error."""
+        big_content = "x" * 100_000
+        messages = [{"role": "user", "content": big_content}]
+        prompt = build_prompt(messages, tools=None)
+        assert big_content in prompt
+
+
+class TestParseCliOutputEdgeCases:
+    def _make_envelope(self, result: str, is_error: bool = False) -> str:
+        return json.dumps({"type": "result", "result": result, "is_error": is_error})
+
+    def test_whitespace_only_stdout_returns_fallback(self):
+        """Whitespace-only stdout is treated the same as empty."""
+        data = parse_cli_output("   \n\t  ")
+        content = data["choices"][0]["message"]["content"]
+        assert "[CiC]" in content
+
+    def test_envelope_with_no_result_key(self):
+        """Envelope missing the 'result' key returns fallback."""
+        stdout = json.dumps({"type": "result", "is_error": False})
+        data = parse_cli_output(stdout)
+        content = data["choices"][0]["message"]["content"]
+        assert "[CiC]" in content
+
+    def test_tool_calls_empty_list_treated_as_text(self):
+        """tool_calls: [] is falsy — should fall through to text handling."""
+        inner = json.dumps({"tool_calls": [], "response": "fallback text"})
+        stdout = self._make_envelope(inner)
+        data = parse_cli_output(stdout)
+        content = data["choices"][0]["message"]["content"]
+        assert content == "fallback text"
+
+    def test_inner_json_with_unknown_keys_falls_back(self):
+        """Inner JSON with no 'tool_calls' or 'response' key serialises the dict."""
+        inner = json.dumps({"foo": "bar"})
+        stdout = self._make_envelope(inner)
+        data = parse_cli_output(stdout)
+        # Falls back to str(inner_dict) — not a crash
+        content = data["choices"][0]["message"]["content"]
+        assert isinstance(content, str)
+
+    def test_error_message_truncated_to_500_chars(self):
+        """CLI error messages longer than 500 chars are truncated."""
+        from cic.exceptions import ClaudeSubprocessError
+        long_error = "E" * 1000
+        stdout = json.dumps({"type": "result", "result": long_error, "is_error": True})
+        with pytest.raises(ClaudeSubprocessError) as exc_info:
+            parse_cli_output(stdout)
+        # The raised message should not contain the full 1000-char error
+        assert len(str(exc_info.value)) < 600
