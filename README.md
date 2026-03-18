@@ -1,8 +1,10 @@
 # CiC — Context in Claude Code
 
-**A Python library for building AI agents on top of the Claude Code CLI.**
+**Build your own personal AI agent using the Claude Code CLI as a subprocess.**
 
-CiC gives you a clean programmatic interface to Claude Code. Define your own tools, let Claude decide which to call, and execute them yourself — the standard agent loop pattern, powered by the `claude` CLI.
+CiC lets you use `claude` as the brain of your agent while you control the body. You define the tools (read files, query APIs, run commands — anything). Claude decides which tools to call. Your code executes them. That's it.
+
+No SDK lock-in. No framework to learn. Just a subprocess, a JSON protocol, and your agent logic.
 
 ---
 
@@ -138,6 +140,12 @@ sequenceDiagram
 ```
 
 Each call is a **fresh subprocess** — no state leaks between calls. Your agent code maintains the conversation history in `messages[]` and passes it each time.
+
+**Under the hood, CiC handles three sharp edges automatically:**
+
+- **Context bloat prevention** — `--setting-sources user` skips project-level CLAUDE.md files that would add ~50K tokens of irrelevant context per call.
+- **Nesting safety** — Strips `CLAUDECODE` and `CLAUDE_CODE_ENTRY_POINT` env vars so CiC works even when called from inside a Claude Code session (hooks, skills, agent-in-agent).
+- **Tool isolation** — `--tools ""` reliably disables all built-in tools at the CLI level. (Note: the official Python SDK's `allowed_tools` parameter is [currently broken](https://github.com/anthropics/claude-agent-sdk-python/issues/361) — CiC bypasses this by going through the CLI directly.)
 
 ---
 

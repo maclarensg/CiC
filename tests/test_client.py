@@ -374,6 +374,67 @@ class TestParseArguments:
 # chat() event loop guard
 # ---------------------------------------------------------------------------
 
+class TestSubprocessEnvironment:
+    """Verify env sanitization in _spawn_claude."""
+
+    @pytest.mark.asyncio
+    async def test_claudecode_env_stripped(self):
+        """CLAUDECODE env var must not leak into subprocess."""
+        client = _make_client(model="sonnet")
+        captured_env = {}
+
+        real_spawn = asyncio.create_subprocess_exec
+
+        async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
+            captured_env.update(kwargs.get("env", {}))
+            # Return a mock process
+            proc = MagicMock()
+            proc.communicate = AsyncMock(
+                return_value=(
+                    _text_response("ok").encode(),
+                    b"",
+                )
+            )
+            proc.kill = MagicMock()
+            return proc
+
+        import os
+        old = os.environ.get("CLAUDECODE")
+        os.environ["CLAUDECODE"] = "1"
+        try:
+            with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec):
+                await client.achat([{"role": "user", "content": "hi"}])
+            assert "CLAUDECODE" not in captured_env
+            assert "CLAUDE_CODE_ENTRY_POINT" not in captured_env
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDECODE", None)
+            else:
+                os.environ["CLAUDECODE"] = old
+
+    @pytest.mark.asyncio
+    async def test_setting_sources_in_cmd(self):
+        """Subprocess cmd should include --setting-sources user."""
+        client = _make_client(model="sonnet")
+        captured_cmd: list[str] = []
+
+        async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
+            captured_cmd.extend(args)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(
+                return_value=(_text_response("ok").encode(), b"")
+            )
+            proc.kill = MagicMock()
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec):
+            await client.achat([{"role": "user", "content": "hi"}])
+
+        assert "--setting-sources" in captured_cmd
+        idx = captured_cmd.index("--setting-sources")
+        assert captured_cmd[idx + 1] == "user"
+
+
 class TestSyncChatEventLoopGuard:
     @pytest.mark.asyncio
     async def test_chat_raises_when_called_inside_event_loop(self):

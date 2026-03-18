@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 from typing import Any
 
@@ -310,13 +311,24 @@ class CiCClient:
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--model", model,
+            # Limit setting sources to user-level only — avoids inheriting
+            # project CLAUDE.md files which add ~50K tokens of context bloat.
+            "--setting-sources", "user",
         ]
+
+        # Build a clean env:
+        # 1. Strip CLAUDECODE — if set (e.g. running inside a Claude Code session),
+        #    it blocks further claude subprocess spawning.
+        # 2. Strip CLAUDE_CODE_ENTRY_POINT — prevents session nesting detection.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRY_POINT")}
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
 
         try:
