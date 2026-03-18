@@ -8,48 +8,20 @@ CiC gives you a clean programmatic interface to Claude Code. Define your own too
 
 ## What CiC Does
 
-```
-                         YOUR AGENT CODE
-                              |
-                    +---------v----------+
-                    |     CiCClient      |
-                    |                    |
-                    |  messages + tools  |
-                    +--------+-----------+
-                             |
-              Builds prompt, spawns subprocess
-                             |
-                    +--------v-----------+
-                    |   claude --print   |
-                    |   --tools ""       |
-                    |   --model sonnet   |
-                    +--------+-----------+
-                             |
-              Claude reasons, returns JSON
-                             |
-                    +--------v-----------+
-                    |     CiCClient      |
-                    |                    |
-                    |  Parses response   |
-                    |  into ChatResult   |
-                    +--------+-----------+
-                             |
-               +-------------+-------------+
-               |                           |
-        Tool calls?                  Text response?
-               |                           |
-      +--------v--------+         +--------v--------+
-      |   result.       |         |   result.       |
-      |   tool_calls    |         |   content       |
-      |                 |         |                 |
-      |  You execute    |         |  Final answer   |
-      |  the tools      |         |  from Claude    |
-      +--------+--------+         +-----------------+
-               |
-        Feed results back
-        into messages[]
-               |
-          Loop again
+```mermaid
+flowchart LR
+    A[Your Agent Code] -->|messages + tools| B[CiCClient]
+    B -->|builds prompt| C["claude --print\n--tools &quot;&quot;\n--model sonnet"]
+    C -->|JSON response| B
+    B --> D{Tool calls?}
+    D -->|Yes| E["result.tool_calls\n→ You execute"]
+    D -->|No| F["result.content\n→ Final answer"]
+    E -->|results back| A
+
+    style B fill:#4a9eff,color:#fff
+    style C fill:#f59e0b,color:#fff
+    style E fill:#10b981,color:#fff
+    style F fill:#8b5cf6,color:#fff
 ```
 
 **Key insight:** Claude Code's built-in tools are disabled (`--tools ""`). Claude only *decides* which of **your** tools to call. **You** execute them. You stay in full control.
@@ -60,42 +32,20 @@ CiC gives you a clean programmatic interface to Claude Code. Define your own too
 
 This is the core pattern CiC enables:
 
-```
-    +------------------+
-    |  Define tools    |  <-- Your tools: read_file, query_db, send_email, etc.
-    +--------+---------+
-             |
-             v
-    +------------------+
-    |  Send task to    |  <-- client.chat(messages, tools=tools)
-    |  CiCClient       |
-    +--------+---------+
-             |
-             v
-    +------------------+        +------------------+
-    |  Claude thinks   | -----> |  "Call read_file  |
-    |  about the task  |        |   with path X"   |
-    +------------------+        +--------+---------+
-                                         |
-                                         v
-                                +------------------+
-                                |  YOUR code runs  |  <-- You execute the tool
-                                |  read_file(X)    |
-                                +--------+---------+
-                                         |
-                                    result text
-                                         |
-                                         v
-                                +------------------+
-                                |  Feed result     |  <-- Append to messages[]
-                                |  back to Claude  |
-                                +--------+---------+
-                                         |
-                                         v
-                                +------------------+
-                                |  Claude thinks   |  <-- May call another tool
-                                |  again...        |      or return final answer
-                                +------------------+
+```mermaid
+flowchart TD
+    A[Define your tools] --> B["client.chat(messages, tools)"]
+    B --> C{Claude's response}
+    C -->|tool_calls| D[Your code executes the tool]
+    C -->|text content| E[Final answer - done!]
+    D --> F[Append result to messages]
+    F --> B
+
+    style A fill:#6366f1,color:#fff
+    style B fill:#4a9eff,color:#fff
+    style D fill:#10b981,color:#fff
+    style E fill:#8b5cf6,color:#fff
+    style F fill:#f59e0b,color:#fff
 ```
 
 ```python
@@ -121,24 +71,28 @@ while True:
 
 ## Smart Routing
 
-Different tasks need different models. CiC routes automatically:
+Different tasks need different models. CiC routes automatically based on complexity:
 
-```
-    Task Complexity          Model Selected         Why
-    ===============          ==============         ===================
+```mermaid
+flowchart LR
+    subgraph Your Code
+        S["set_complexity()"]
+    end
 
-    "Is X prime?"     ───>   Haiku                  Fast, simple lookup
-    "Fix this bug"    ───>   Sonnet                 Balanced reasoning
-    "Design a system" ───>   Opus                   Deep, multi-step logic
+    subgraph CiC Router
+        S --> R{Complexity?}
+        R -->|simple| H["Haiku\nFast lookups"]
+        R -->|moderate| SO["Sonnet\nBalanced"]
+        R -->|complex| O["Opus\nDeep reasoning"]
+    end
 
+    H --> CLI["claude --model haiku"]
+    SO --> CLI2["claude --model sonnet"]
+    O --> CLI3["claude --model opus"]
 
-    +--------------------------------------------------+
-    |              CiCClient with routing               |
-    |                                                   |
-    |   set_complexity("simple")  ──> haiku             |
-    |   set_complexity("moderate") ──> sonnet           |
-    |   set_complexity("complex") ──> opus              |
-    +--------------------------------------------------+
+    style H fill:#10b981,color:#fff
+    style SO fill:#4a9eff,color:#fff
+    style O fill:#8b5cf6,color:#fff
 ```
 
 ```python
@@ -159,44 +113,57 @@ result = client.chat(messages)   # Uses Opus
 
 ## How It Works Under the Hood
 
-```
-    Your Python code                     claude CLI process
-    ================                     ==================
+```mermaid
+sequenceDiagram
+    participant App as Your App
+    participant CiC as CiCClient
+    participant CLI as claude CLI
 
-    client.chat(msgs, tools)
-           |
-           |  1. Build prompt:
-           |     - System: "You have these tools: ..."
-           |     - History: [User said X, Assistant called Y, Tool returned Z]
-           |     - "Respond with JSON tool_calls or final response"
-           |
-           +------- stdin -------->  claude --print
-                                     --output-format json
-                                     --tools ""
-                                     --model sonnet
-                                     --no-session-persistence
+    App->>CiC: chat(messages, tools)
 
-                                        Claude reads prompt
-                                        Reasons about task
-                                        Picks tools (or answers)
+    Note over CiC: Build prompt:<br/>System + tool descriptions<br/>+ conversation history
 
-           <------ stdout ---------  {"type":"result",
-                                      "result": "{\"tool_calls\":[...]}"}
-           |
-           |  2. Parse JSON envelope
-           |  3. Extract inner response
-           |  4. Convert to OpenAI format:
-           |     {"choices":[{"message":{"tool_calls":[...]}}]}
-           |
-           v
-    return ChatResult(
-        tool_calls=[ToolCall(name="read_file", arguments={...})],
-        content=None,
-        model="cic/sonnet"
-    )
+    CiC->>CLI: stdin: prompt text
+    Note over CLI: claude --print<br/>--output-format json<br/>--tools ""<br/>--model sonnet
+
+    Note over CLI: Claude reasons<br/>about the task...<br/>Picks tools or answers
+
+    CLI-->>CiC: stdout: {"type":"result", "result":"..."}
+
+    Note over CiC: Parse JSON envelope<br/>Extract inner response<br/>Convert to OpenAI format
+
+    CiC-->>App: ChatResult(tool_calls=[...])
+
+    Note over App: Execute tools,<br/>append results,<br/>call chat() again
 ```
 
 Each call is a **fresh subprocess** — no state leaks between calls. Your agent code maintains the conversation history in `messages[]` and passes it each time.
+
+---
+
+## Comparing Approaches
+
+```mermaid
+flowchart TD
+    subgraph Traditional["Traditional: REST API"]
+        A1[Your Code] -->|HTTP POST| A2[api.anthropic.com]
+        A2 -->|JSON response| A1
+        A3["Requires API key\nPay per token\nHigh throughput"]
+    end
+
+    subgraph CiC["CiC: Claude CLI"]
+        B1[Your Code] -->|subprocess| B2[claude --print]
+        B2 -->|JSON response| B1
+        B3["Uses CLI auth\nSubscription limits apply\nFresh context per call"]
+    end
+
+    style Traditional fill:#1e293b,color:#fff
+    style CiC fill:#1e293b,color:#fff
+    style A2 fill:#f59e0b,color:#fff
+    style B2 fill:#4a9eff,color:#fff
+```
+
+CiC is for developers building tools and agents on top of Claude Code. For production workloads with high throughput requirements, use the [Anthropic API](https://docs.anthropic.com/) directly.
 
 ---
 
@@ -210,7 +177,12 @@ cd CiC
 pip install -e .
 ```
 
-**Prerequisite:** [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`npm install -g @anthropic-ai/claude-code && claude`).
+**Prerequisite:** [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated.
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude  # authenticate on first run
+```
 
 ### Basic chat
 
@@ -282,21 +254,13 @@ while True:
 
 ## OpenAI Drop-In Compatibility
 
-```
-    Existing code using OpenAI format:
+```python
+response = client.chat_openai_format(messages, tools=tools)
 
-    response["choices"][0]["message"]["content"]
-    response["choices"][0]["message"]["tool_calls"]
-    response["choices"][0]["finish_reason"]
-
-                        |
-                  Just swap to:
-                        |
-                        v
-
-    response = client.chat_openai_format(messages, tools=tools)
-
-    # Same structure, same access pattern
+# Same structure as OpenAI responses:
+response["choices"][0]["message"]["content"]
+response["choices"][0]["message"]["tool_calls"]
+response["choices"][0]["finish_reason"]
 ```
 
 ---
@@ -357,7 +321,7 @@ CiCClient(
 ## Limitations
 
 - **No streaming** — each call waits for the full response
-- **~1-2s overhead per call** — subprocess spawn time; not for high-throughput
+- **~1-2s overhead per call** — subprocess spawn time
 - **Token estimates only** — usage is approximated (chars / 4)
 - **Subscription limits apply** — your Claude plan's limits are unchanged; CiC does not modify, bypass, or circumvent any usage policies
 
