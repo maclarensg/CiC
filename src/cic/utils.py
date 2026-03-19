@@ -26,6 +26,16 @@ When you have completed the task and need no more tools, respond with:
 {"response": "your final answer here"}
 
 NEVER mix tool_calls and response in the same JSON object.
+
+CRITICAL ACTION RULES:
+1. WORK SEQUENCE: read → edit → test → done. After reading 2-3 files, your NEXT \
+call MUST be an edit (file_edit, file_write, or shell_exec). Do NOT keep reading.
+2. NEVER read the same file twice. The content is already in the conversation.
+3. ALL tool calls MUST include required arguments. Never call a tool with empty arguments {}.
+4. PREFER SMALL EDITS. Edit what you know, run tests, fix failures. Do not try to \
+understand the entire codebase before making a change.
+5. GIVE UP AFTER 3 FAILURES. If you cannot complete the task, respond with \
+{"response": "BLOCKED: <reason>"}. Do NOT keep reading.
 """
 
 _TOOL_SECTION_TEMPLATE = """\
@@ -37,10 +47,63 @@ AVAILABLE TOOLS:
 _MAX_TOOL_ARG_CHARS = 200
 _MAX_TOOL_RESULT_CHARS = 2000
 
+# Tools that are "read-only" — stripped after N reads to force edits.
+DEFAULT_READ_TOOLS = frozenset({
+    "file_read", "content_search", "file_search", "list_directory",
+    "read_file", "search_files", "grep", "find",
+})
+_READ_THRESHOLD = 3
+
+
+def _count_reads_in_messages(
+    messages: list[dict[str, Any]],
+    read_tools: frozenset[str] = DEFAULT_READ_TOOLS,
+) -> int:
+    """Count how many read-type tool calls are in the conversation history."""
+    count = 0
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls", []):
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                if name in read_tools:
+                    count += 1
+    return count
+
+
+def _scope_tools_for_action(
+    tools: list[dict[str, Any]],
+    read_count: int,
+    read_tools: frozenset[str] = DEFAULT_READ_TOOLS,
+    threshold: int = _READ_THRESHOLD,
+) -> tuple[list[dict[str, Any]], bool]:
+    """After N reads, strip read tools — force the model to edit or finish.
+
+    Returns:
+        Tuple of (scoped_tools, is_action_mode).
+    """
+    if read_count < threshold:
+        return tools, False
+    action_tools = [
+        t for t in tools
+        if _get_tool_name(t) not in read_tools
+    ]
+    if action_tools:
+        return action_tools, True
+    return tools, False  # Don't strip if no action tools remain
+
+
+def _get_tool_name(tool: dict[str, Any]) -> str:
+    """Extract tool name from OpenAI-format or unwrapped tool dict."""
+    fn = tool.get("function", tool)
+    return fn.get("name", "")
+
 
 def build_prompt(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
+    read_tools: frozenset[str] | None = None,
+    read_threshold: int = _READ_THRESHOLD,
 ) -> str:
     """Flatten messages and tool descriptions into a single prompt string.
 
@@ -48,9 +111,16 @@ def build_prompt(
     function serialises system instructions, available tools (if any), and
     the conversation history into that single string.
 
+    Dynamic tool scoping: after ``read_threshold`` read-type tool calls in
+    the conversation, read tools are stripped from the tool descriptions.
+    This forces the model to edit or finish rather than reading endlessly.
+
     Args:
         messages: OpenAI-format messages list.
         tools: OpenAI-format tool definitions, or None.
+        read_tools: Set of tool names considered "read-only". Defaults to
+            ``DEFAULT_READ_TOOLS``.
+        read_threshold: Number of reads before stripping. Default 3.
 
     Returns:
         A single UTF-8 string suitable for piping to ``claude --print``.
@@ -58,8 +128,20 @@ def build_prompt(
     parts: list[str] = [_SYSTEM_PROMPT]
 
     if tools:
-        desc = _build_tool_descriptions(tools)
+        _rt = read_tools if read_tools is not None else DEFAULT_READ_TOOLS
+        read_count = _count_reads_in_messages(messages, _rt)
+        scoped, action_mode = _scope_tools_for_action(
+            tools, read_count, _rt, read_threshold
+        )
+        desc = _build_tool_descriptions(scoped)
         parts.append(_TOOL_SECTION_TEMPLATE.format(tool_descriptions=desc))
+
+        if action_mode:
+            parts.append(
+                ">>> YOU HAVE READ ENOUGH. Read tools are no longer available. "
+                "Your ONLY options are edit/write/exec tools or "
+                '{"response": "..."}. Make an edit or finish. <<<'
+            )
 
     parts.append("CONVERSATION HISTORY:")
     parts.append(_format_messages(messages))

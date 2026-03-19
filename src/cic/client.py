@@ -311,9 +311,11 @@ class CiCClient:
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--model", model,
-            # Limit setting sources to user-level only — avoids inheriting
-            # project CLAUDE.md files which add ~50K tokens of context bloat.
+            # Reduce ~45K → ~3K token cache tax per call
             "--setting-sources", "user",
+            "--system-prompt", "",
+            # Strip ALL MCP tools (e.g. Google Calendar) — only our text-described tools
+            "--strict-mcp-config",
         ]
 
         # Build a clean env:

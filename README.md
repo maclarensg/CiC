@@ -141,11 +141,12 @@ sequenceDiagram
 
 Each call is a **fresh subprocess** — no state leaks between calls. Your agent code maintains the conversation history in `messages[]` and passes it each time.
 
-**Under the hood, CiC handles three sharp edges automatically:**
+**Under the hood, CiC handles four sharp edges automatically:**
 
-- **Context bloat prevention** — `--setting-sources user` skips project-level CLAUDE.md files that would add ~50K tokens of irrelevant context per call.
+- **Context bloat prevention** — `--setting-sources user` + `--system-prompt ""` reduces cache creation from ~45K to ~3K tokens per call (13x reduction).
+- **MCP isolation** — `--strict-mcp-config` strips all MCP tools (e.g. Google Calendar) that would confuse the model into thinking those are its only tools.
 - **Nesting safety** — Strips `CLAUDECODE` and `CLAUDE_CODE_ENTRY_POINT` env vars so CiC works even when called from inside a Claude Code session (hooks, skills, agent-in-agent).
-- **Tool isolation** — `--tools ""` reliably disables all built-in tools at the CLI level. (Note: the official Python SDK's `allowed_tools` parameter is [currently broken](https://github.com/anthropics/claude-agent-sdk-python/issues/361) — CiC bypasses this by going through the CLI directly.)
+- **Dynamic tool scoping** — After 3 read-type tool calls (file_read, content_search, etc.), read tools are stripped from the prompt. The model can only edit, write, or finish. This prevents the "read forever, never edit" loop that occurs when models have both read and edit tools available via text descriptions.
 
 ---
 

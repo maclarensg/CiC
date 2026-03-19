@@ -407,3 +407,88 @@ class TestParseCliOutputEdgeCases:
             parse_cli_output(stdout)
         # The raised message should not contain the full 1000-char error
         assert len(str(exc_info.value)) < 600
+
+
+# ---------------------------------------------------------------------------
+# Dynamic tool scoping
+# ---------------------------------------------------------------------------
+
+from cic.utils import _count_reads_in_messages, _scope_tools_for_action, DEFAULT_READ_TOOLS
+
+
+class TestCountReadsInMessages:
+    def test_no_messages(self):
+        assert _count_reads_in_messages([]) == 0
+
+    def test_no_tool_calls(self):
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        assert _count_reads_in_messages(msgs) == 0
+
+    def test_counts_read_tools(self):
+        msgs = [
+            {"role": "assistant", "tool_calls": [
+                {"function": {"name": "file_read", "arguments": "{}"}},
+                {"function": {"name": "content_search", "arguments": "{}"}},
+            ]},
+            {"role": "assistant", "tool_calls": [
+                {"function": {"name": "file_edit", "arguments": "{}"}},
+            ]},
+        ]
+        assert _count_reads_in_messages(msgs) == 2
+
+    def test_custom_read_tools(self):
+        msgs = [{"role": "assistant", "tool_calls": [
+            {"function": {"name": "my_reader", "arguments": "{}"}},
+        ]}]
+        assert _count_reads_in_messages(msgs, frozenset({"my_reader"})) == 1
+
+
+class TestScopeToolsForAction:
+    def _make_tools(self, names):
+        return [{"function": {"name": n, "description": ""}} for n in names]
+
+    def test_below_threshold_returns_all(self):
+        tools = self._make_tools(["file_read", "file_edit", "shell_exec"])
+        scoped, action_mode = _scope_tools_for_action(tools, read_count=1)
+        assert len(scoped) == 3
+        assert action_mode is False
+
+    def test_at_threshold_strips_reads(self):
+        tools = self._make_tools(["file_read", "content_search", "file_edit", "shell_exec"])
+        scoped, action_mode = _scope_tools_for_action(tools, read_count=3)
+        names = [t["function"]["name"] for t in scoped]
+        assert "file_read" not in names
+        assert "content_search" not in names
+        assert "file_edit" in names
+        assert action_mode is True
+
+    def test_keeps_all_if_no_action_tools(self):
+        tools = self._make_tools(["file_read", "content_search"])
+        scoped, action_mode = _scope_tools_for_action(tools, read_count=5)
+        assert len(scoped) == 2  # fallback: don't strip everything
+        assert action_mode is False
+
+
+class TestBuildPromptDynamicScoping:
+    def _make_tools(self, names):
+        return [{"function": {"name": n, "description": f"Tool {n}", "parameters": {"type": "object", "properties": {}}}} for n in names]
+
+    def test_action_mode_directive_in_prompt(self):
+        tools = self._make_tools(["file_read", "file_edit"])
+        msgs = [
+            {"role": "assistant", "tool_calls": [
+                {"function": {"name": "file_read", "arguments": "{}"}},
+                {"function": {"name": "file_read", "arguments": "{}"}},
+                {"function": {"name": "file_read", "arguments": "{}"}},
+            ]},
+        ]
+        prompt = build_prompt(msgs, tools, read_threshold=3)
+        assert "READ ENOUGH" in prompt
+        assert "file_read" not in prompt.split("AVAILABLE TOOLS:")[1].split("CONVERSATION")[0]
+
+    def test_no_action_mode_below_threshold(self):
+        tools = self._make_tools(["file_read", "file_edit"])
+        msgs = [{"role": "user", "content": "hi"}]
+        prompt = build_prompt(msgs, tools, read_threshold=3)
+        assert "READ ENOUGH" not in prompt
+        assert "file_read" in prompt
