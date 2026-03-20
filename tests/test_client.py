@@ -33,13 +33,31 @@ def _cli_envelope(result: str, is_error: bool = False) -> str:
 
 
 def _text_response(text: str) -> str:
-    """Build a fake CLI envelope with a plain text response."""
-    return _cli_envelope(json.dumps({"response": text}))
+    """Build a fake CLI envelope with a plain text response (hybrid mode)."""
+    return json.dumps({
+        "type": "result",
+        "result": "",
+        "is_error": False,
+        "structured_output": {
+            "summary": text,
+            "files_modified": [],
+            "pending_tool_calls": [],
+        },
+    })
 
 
 def _tool_call_response(tool_calls: list[dict[str, Any]]) -> str:
-    """Build a fake CLI envelope with tool calls."""
-    return _cli_envelope(json.dumps({"tool_calls": tool_calls}))
+    """Build a fake CLI envelope with pending tool calls (hybrid mode)."""
+    return json.dumps({
+        "type": "result",
+        "result": "",
+        "is_error": False,
+        "structured_output": {
+            "summary": "Task done",
+            "files_modified": [],
+            "pending_tool_calls": tool_calls,
+        },
+    })
 
 
 def _make_client(**kwargs: Any) -> CiCClient:
@@ -240,13 +258,24 @@ class TestAChatErrorHandling:
             await client.achat([{"role": "user", "content": "hi"}])
 
     @pytest.mark.asyncio
-    async def test_non_json_response_treated_as_text(self):
+    async def test_blocked_response_treated_as_text(self):
+        """blocked field in structured_output → content response."""
         client = _make_client(model="sonnet")
-        client._spawn_claude = _mock_spawn(
-            _cli_envelope("This is not JSON, just text.")
-        )
+        blocked_envelope = json.dumps({
+            "type": "result",
+            "result": "",
+            "is_error": False,
+            "structured_output": {
+                "summary": "",
+                "files_modified": [],
+                "pending_tool_calls": [],
+                "blocked": "File not found",
+            },
+        })
+        client._spawn_claude = _mock_spawn(blocked_envelope)
         result = await client.achat([{"role": "user", "content": "hi"}])
-        assert result.content == "This is not JSON, just text."
+        assert result.content is not None
+        assert "BLOCKED" in result.content
         assert not result.has_tool_calls
 
 
@@ -433,6 +462,29 @@ class TestSubprocessEnvironment:
         assert "--setting-sources" in captured_cmd
         idx = captured_cmd.index("--setting-sources")
         assert captured_cmd[idx + 1] == "user"
+
+    @pytest.mark.asyncio
+    async def test_hybrid_mode_flags_in_cmd(self):
+        """Hybrid mode must use --tools Bash,Edit,Read,Write and --json-schema."""
+        client = _make_client(model="sonnet")
+        captured_cmd: list[str] = []
+
+        async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
+            captured_cmd.extend(args)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(
+                return_value=(_text_response("ok").encode(), b"")
+            )
+            proc.kill = MagicMock()
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec):
+            await client.achat([{"role": "user", "content": "hi"}])
+
+        assert "--tools" in captured_cmd
+        tools_idx = captured_cmd.index("--tools")
+        assert captured_cmd[tools_idx + 1] == "Bash,Edit,Read,Write"
+        assert "--json-schema" in captured_cmd
 
 
 class TestSyncChatEventLoopGuard:

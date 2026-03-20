@@ -2,72 +2,119 @@
 
 **Build your own personal AI agent using the Claude Code CLI as a subprocess.**
 
-CiC lets you use `claude` as the brain of your agent while you control the body. You define the tools (read files, query APIs, run commands — anything). Claude decides which tools to call. Your code executes them. That's it.
+CiC lets you use `claude` as the brain of your agent while you control the body. Claude handles file operations itself using its built-in tools. You define the custom tools (update databases, call APIs, move kanban cards — anything that Claude can't do natively). Claude decides when to call them. Your code executes them. That's it.
 
-No SDK lock-in. No framework to learn. Just a subprocess, a JSON protocol, and your agent logic.
+No SDK lock-in. No framework to learn. Just a subprocess, structured output, and your agent logic.
 
 ---
 
-## What CiC Does
+## How Hybrid Mode Works
+
+CiC uses **hybrid mode**: Claude keeps its built-in file tools (`Bash`, `Edit`, `Read`, `Write`) and edits files ITSELF inside the subprocess. Custom tools you define are returned via `--json-schema` structured output and executed by your agent loop.
 
 ```mermaid
 flowchart LR
-    A[Your Agent Code] -->|messages + tools| B[CiCClient]
-    B -->|builds prompt| C["claude --print\n--tools &quot;&quot;\n--model sonnet"]
-    C -->|JSON response| B
-    B --> D{Tool calls?}
-    D -->|Yes| E["result.tool_calls\n→ You execute"]
-    D -->|No| F["result.content\n→ Final answer"]
-    E -->|results back| A
+    A[Your Agent Code] -->|messages + custom tools| B[CiCClient]
+    B -->|builds prompt + json-schema| C["claude --print\n--tools Bash,Edit,Read,Write\n--json-schema schema\n--model sonnet"]
+    C -->|edits files directly| D["File System"]
+    C -->|structured_output| B
+    B --> E{pending_tool_calls?}
+    E -->|Yes| F["result.tool_calls\n→ You execute custom tools"]
+    E -->|No| G["result.content\n→ Final answer"]
+    F -->|results back| A
 
+    style B fill:#4a9eff,color:#fff
+    style C fill:#f59e0b,color:#fff
+    style D fill:#ef4444,color:#fff
+    style F fill:#10b981,color:#fff
+    style G fill:#8b5cf6,color:#fff
+```
+
+**The key insight:** Claude edits files ITSELF. Your code only executes custom tools (database updates, kanban moves, API calls — things Claude can't do natively). This eliminates the phantom edit bug.
+
+---
+
+## The Phantom Edit Bug (What We Fixed)
+
+The old approach (`--tools ""`) disabled ALL of Claude's built-in tools. Claude had to describe file edits as tool calls in narrative JSON, which the framework then executed. This broke in practice:
+
+1. Claude sometimes returned tool calls embedded in narrative text (never parsed)
+2. Claude sometimes described what it would do without actually calling the tool
+3. Tasks were falsely marked as complete because the agent loop exited on `"response": "..."` even though no files were changed
+
+**Hybrid mode fixes this:** Claude just uses `Edit` or `Write` directly. The files change. The structured output confirms what changed. No ambiguity.
+
+```
+OLD (broken):                          NEW (hybrid):
+claude --tools ""                      claude --tools "Bash,Edit,Read,Write"
+                                             --json-schema schema
+
+Claude returns:                        Claude does:
+{"tool_calls": [{"name":               1. Reads the file with Read tool
+  "file_edit", "arguments":            2. Edits with Edit tool (file changes NOW)
+  {"path": "...", "old": "..."}}]}     3. Returns structured output:
+                                          {"summary": "Fixed the bug",
+Your code runs the edit.                   "files_modified": ["/path/to/file.py"],
+                                           "pending_tool_calls": [
+Sometimes Claude wrote text                {"name": "notify_done", ...}]}
+instead of JSON. Edit never ran.
+Card moved to done. Bug unfixed.
+```
+
+---
+
+## The Agent Loop
+
+```mermaid
+flowchart TD
+    A[Define custom tools] --> B["client.chat(messages, tools)"]
+    B --> C["claude subprocess\nedits files directly"]
+    C --> D{pending_tool_calls?}
+    D -->|Yes| E[Your code executes custom tools]
+    D -->|No| F[Final answer - done!]
+    E --> G[Append result to messages]
+    G --> B
+
+    style A fill:#6366f1,color:#fff
     style B fill:#4a9eff,color:#fff
     style C fill:#f59e0b,color:#fff
     style E fill:#10b981,color:#fff
     style F fill:#8b5cf6,color:#fff
 ```
 
-**Key insight:** Claude Code's built-in tools are disabled (`--tools ""`). Claude only *decides* which of **your** tools to call. **You** execute them. You stay in full control.
-
----
-
-## The Agent Loop
-
-This is the core pattern CiC enables:
-
-```mermaid
-flowchart TD
-    A[Define your tools] --> B["client.chat(messages, tools)"]
-    B --> C{Claude's response}
-    C -->|tool_calls| D[Your code executes the tool]
-    C -->|text content| E[Final answer - done!]
-    D --> F[Append result to messages]
-    F --> B
-
-    style A fill:#6366f1,color:#fff
-    style B fill:#4a9eff,color:#fff
-    style D fill:#10b981,color:#fff
-    style E fill:#8b5cf6,color:#fff
-    style F fill:#f59e0b,color:#fff
-```
-
 ```python
 from cic import CiCClient
 
+# Only define custom tools — file tools are handled by Claude natively
+custom_tools = [
+    {
+        "name": "notify_done",
+        "description": "Send a notification when the task is complete.",
+        "parameters": {
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+        },
+    }
+]
+
 client = CiCClient(model="sonnet")
-messages = [{"role": "user", "content": "Read config.yaml and summarize it"}]
+messages = [{"role": "user", "content": "Fix the bug in main.py line 42"}]
 
 while True:
-    result = client.chat(messages, tools=my_tools)
+    result = client.chat(messages, tools=custom_tools)
 
     if not result.has_tool_calls:
         print("Done:", result.content)
         break
 
-    # Claude decided — now YOU execute
+    # Claude decided to call a custom tool — now YOU execute it
     for tc in result.tool_calls:
         output = execute_tool(tc.name, tc.arguments)
         messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 ```
+
+Claude handles `Read`, `Edit`, `Bash` itself. You only execute `notify_done`.
 
 ---
 
@@ -120,33 +167,36 @@ sequenceDiagram
     participant App as Your App
     participant CiC as CiCClient
     participant CLI as claude CLI
+    participant FS as File System
 
-    App->>CiC: chat(messages, tools)
+    App->>CiC: chat(messages, custom_tools)
 
-    Note over CiC: Build prompt:<br/>System + tool descriptions<br/>+ conversation history
+    Note over CiC: Build prompt:<br/>System + custom tool descriptions<br/>+ conversation history
 
-    CiC->>CLI: stdin: prompt text
-    Note over CLI: claude --print<br/>--output-format json<br/>--tools ""<br/>--model sonnet
+    CiC->>CLI: stdin: prompt text<br/>--tools Bash,Edit,Read,Write<br/>--json-schema schema
 
-    Note over CLI: Claude reasons<br/>about the task...<br/>Picks tools or answers
+    Note over CLI: Claude reasons about the task...
+    CLI->>FS: Edit("main.py", old, new)
+    CLI->>FS: Bash("pytest tests/")
 
-    CLI-->>CiC: stdout: {"type":"result", "result":"..."}
+    CLI-->>CiC: stdout: {"structured_output": {"summary": "...", "files_modified": [...], "pending_tool_calls": [...]}}
 
-    Note over CiC: Parse JSON envelope<br/>Extract inner response<br/>Convert to OpenAI format
+    Note over CiC: Parse structured_output<br/>Log files_modified<br/>Convert pending_tool_calls to OpenAI format
 
-    CiC-->>App: ChatResult(tool_calls=[...])
+    CiC-->>App: ChatResult(tool_calls=[notify_done(...)])
 
-    Note over App: Execute tools,<br/>append results,<br/>call chat() again
+    Note over App: Execute custom tools,<br/>append results,<br/>call chat() again
 ```
 
 Each call is a **fresh subprocess** — no state leaks between calls. Your agent code maintains the conversation history in `messages[]` and passes it each time.
 
-**Under the hood, CiC handles four sharp edges automatically:**
+**CiC handles several sharp edges automatically:**
 
-- **Context bloat prevention** — `--setting-sources user` + `--system-prompt ""` reduces cache creation from ~45K to ~3K tokens per call (13x reduction).
-- **MCP isolation** — `--strict-mcp-config` strips all MCP tools (e.g. Google Calendar) that would confuse the model into thinking those are its only tools.
+- **File edits happen in the subprocess.** No phantom edits. Files change before structured output is returned.
+- **Context bloat prevention** — `--setting-sources user` + `--system-prompt` reduces cache creation from ~45K to ~3K tokens per call (13x reduction).
+- **MCP isolation** — `--strict-mcp-config` strips all MCP tools (e.g. Google Calendar) that would confuse the model.
 - **Nesting safety** — Strips `CLAUDECODE` and `CLAUDE_CODE_ENTRY_POINT` env vars so CiC works even when called from inside a Claude Code session (hooks, skills, agent-in-agent).
-- **Dynamic tool scoping** — After 3 read-type tool calls (file_read, content_search, etc.), read tools are stripped from the prompt. The model can only edit, write, or finish. This prevents the "read forever, never edit" loop that occurs when models have both read and edit tools available via text descriptions.
+- **Native tool filtering** — File/shell tools in your `tools` list are automatically stripped from the prompt description since Claude handles them natively.
 
 ---
 
@@ -160,10 +210,11 @@ flowchart TD
         A3["Requires API key\nPay per token\nHigh throughput"]
     end
 
-    subgraph CiC["CiC: Claude CLI"]
+    subgraph CiC["CiC: Claude CLI (Hybrid Mode)"]
         B1[Your Code] -->|subprocess| B2[claude --print]
-        B2 -->|JSON response| B1
-        B3["Uses CLI auth\nSubscription limits apply\nFresh context per call"]
+        B2 -->|edits files directly| B3[File System]
+        B2 -->|structured_output| B1
+        B4["Uses CLI auth\nSubscription limits apply\nFiles changed in subprocess"]
     end
 
     style Traditional fill:#1e293b,color:#fff
@@ -217,47 +268,61 @@ async def main():
 asyncio.run(main())
 ```
 
-### Tool use agent
+### Agent with custom tools
 
 ```python
 from cic import CiCClient
 
-tools = [
+# Only define custom tools — Claude handles file operations natively
+custom_tools = [
     {
-        "name": "read_file",
-        "description": "Read a file from disk.",
+        "name": "update_database",
+        "description": "Update a record in the database after code changes.",
         "parameters": {
             "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
+            "properties": {
+                "table": {"type": "string"},
+                "record_id": {"type": "string"},
+                "status": {"type": "string"},
+            },
+            "required": ["table", "record_id", "status"],
         },
     }
 ]
 
 client = CiCClient(model="sonnet")
-messages = [{"role": "user", "content": "Read /etc/hostname and tell me what it says."}]
+messages = [{"role": "user", "content": "Fix the validation bug in user.py and mark task T-42 as done."}]
 
 while True:
-    result = client.chat(messages, tools=tools)
+    result = client.chat(messages, tools=custom_tools)
 
     if not result.has_tool_calls:
-        print("Answer:", result.content)
+        print("Done:", result.content)
         break
 
-    messages.append({
-        "role": "assistant", "content": None,
-        "tool_calls": [
-            {"id": tc.id, "type": "function",
-             "function": {"name": tc.name, "arguments": tc.arguments_json()}}
-            for tc in result.tool_calls
-        ],
-    })
-
+    # Only custom tools come back here — file edits already happened
     for tc in result.tool_calls:
-        with open(tc.arguments["path"]) as f:
-            output = f.read()
+        if tc.name == "update_database":
+            db.update(tc.arguments["table"], tc.arguments["record_id"], tc.arguments["status"])
+            output = f"Updated {tc.arguments['table']} record {tc.arguments['record_id']}"
         messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": output})
 ```
+
+---
+
+## Structured Output Format
+
+When using hybrid mode, Claude returns a structured response with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `summary` | `string` | What Claude did — files changed, commands run, outcomes |
+| `files_modified` | `string[]` | Absolute paths of files Claude created or modified |
+| `pending_tool_calls` | `object[]` | Custom tools to execute (name + arguments) |
+| `test_results` | `string` (optional) | Test output if tests were run |
+| `blocked` | `string` (optional) | Why Claude could not complete the task |
+
+CiC converts `pending_tool_calls` to OpenAI `tool_calls` format automatically, so `result.tool_calls` works the same as before.
 
 ---
 
@@ -281,9 +346,9 @@ response["choices"][0]["finish_reason"]
 ```python
 CiCClient(
     model: str | None = None,               # Fixed model ("sonnet", "opus", "haiku")
-    routing: dict[str, str] | None = None,   # Complexity -> model map
-    timeout: float = 120.0,                  # Subprocess timeout (seconds)
-    claude_path: str | None = None,          # Path to claude binary
+    routing: dict[str, str] | None = None,  # Complexity -> model map
+    timeout: float = 120.0,                 # Subprocess timeout (seconds)
+    claude_path: str | None = None,         # Path to claude binary
 )
 ```
 
@@ -301,7 +366,7 @@ CiCClient(
 | Field | Type | Description |
 |-------|------|-------------|
 | `content` | `str \| None` | Text response (None if tool calls) |
-| `tool_calls` | `list[ToolCall]` | Tool call decisions |
+| `tool_calls` | `list[ToolCall]` | Custom tool call decisions |
 | `has_tool_calls` | `bool` | True if tool_calls is non-empty |
 | `model` | `str` | Model used (e.g. `"cic/sonnet"`) |
 | `usage` | `TokenUsage` | Estimated token usage |

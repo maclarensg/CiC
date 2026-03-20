@@ -1,5 +1,10 @@
 """Internal utilities for prompt building and response parsing.
 
+Hybrid mode: Claude executes file edits using its own built-in tools (Bash, Edit,
+Read, Write). Custom tools (defined by the caller) are reported back via structured
+output in the pending_tool_calls field. The agent loop executes those after Claude
+finishes.
+
 These helpers are not part of the public API but are tested directly
 because the prompt/parse logic is critical to correct behaviour.
 """
@@ -7,90 +12,103 @@ because the prompt/parse logic is critical to correct behaviour.
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from .exceptions import ClaudeSubprocessError, ResponseParseError
 
-# System prompt injected at the top of every CiC call.
-# Instructs the model to respond with exactly one JSON object.
+# System prompt for hybrid mode.
+# Claude uses its own file tools — only custom (caller-defined) tools need description.
 _SYSTEM_PROMPT = """\
-You are an AI agent. You have access to tools described below.
+You are an AI agent. You have access to your built-in file tools \
+(Bash, Edit, Read, Write) — use them directly to make file edits, run \
+commands, and read files.
 
-YOUR RESPONSE MUST BE EXACTLY ONE JSON OBJECT. Nothing else. No text before it. \
-No text after it. No markdown. No explanation. ONLY the JSON object.
+For custom tools listed below, you CANNOT call them directly. Instead, report \
+them in the pending_tool_calls field of your structured output so the calling \
+application can execute them after you finish.
 
-To call a tool:
-{"tool_calls": [{"id": "call_1", "name": "tool_name", "arguments": {"param": "value"}}]}
-
-When done (no more tools needed):
-{"response": "description of what was done"}
-
-RULES:
-1. YOUR ENTIRE RESPONSE IS ONE JSON OBJECT. If you write ANY text outside the JSON, \
-the system cannot parse your tool call and the edit WILL BE LOST.
-2. Do NOT narrate what you will do. Do NOT explain your reasoning. Just output the JSON.
-3. After reading 2-3 files, your next response MUST be a file_edit or file_write tool call.
-4. ALL tool arguments are REQUIRED. file_edit needs path, old_string, new_string. \
-shell_exec needs command. run_tests needs path. NEVER use empty arguments {}.
-5. Do NOT claim work is done without actually calling file_edit/file_write. \
-If you did not call an edit tool, the code has NOT changed.
-6. If you cannot complete the task, respond with {"response": "BLOCKED: reason"}.
+IMPORTANT:
+1. Use your built-in tools (Bash, Edit, Read, Write) to make ALL file changes.
+2. Do NOT describe what you will do — just do it using your tools.
+3. After completing file work, report any custom tool calls needed in pending_tool_calls.
+4. If you cannot complete the task, explain why in the blocked field.
 """
 
 _TOOL_SECTION_TEMPLATE = """\
-AVAILABLE TOOLS:
+CUSTOM TOOLS (report in pending_tool_calls — do NOT describe as text):
 {tool_descriptions}
 
 """
 
+# The JSON schema for structured output.
+# The caller fills this in with what Claude did and what custom tools to run next.
+STRUCTURED_OUTPUT_SCHEMA = json.dumps({
+    "type": "object",
+    "properties": {
+        "summary": {
+            "type": "string",
+            "description": "What you did — files changed, commands run, outcomes",
+        },
+        "files_modified": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Absolute paths of files you created or modified",
+        },
+        "pending_tool_calls": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "arguments": {"type": "object"},
+                },
+                "required": ["name", "arguments"],
+            },
+            "description": "Custom tools to execute after Claude finishes file work",
+        },
+        "test_results": {
+            "type": "string",
+            "description": "Test output if tests were run (optional)",
+        },
+        "blocked": {
+            "type": "string",
+            "description": "If you could not complete the task, explain why (optional)",
+        },
+    },
+    "required": ["summary", "files_modified", "pending_tool_calls"],
+})
+
 _MAX_TOOL_ARG_CHARS = 200
 _MAX_TOOL_RESULT_CHARS = 2000
 
-# Tools that are "read-only" — stripped after N reads to force edits.
-DEFAULT_READ_TOOLS = frozenset({
-    "file_read", "content_search", "file_search", "list_directory",
-    "read_file", "search_files", "grep", "find",
+# Tools that Claude handles natively in hybrid mode.
+# These are NOT described in the prompt — Claude just uses them directly.
+DEFAULT_NATIVE_TOOLS = frozenset({
+    "file_read", "file_edit", "file_write", "file_append",
+    "shell_exec", "run_tests", "content_search", "file_search", "list_directory",
+    "read_file", "write_file", "edit_file", "exec_command",
 })
-_READ_THRESHOLD = 3
 
 
-def _count_reads_in_messages(
-    messages: list[dict[str, Any]],
-    read_tools: frozenset[str] = DEFAULT_READ_TOOLS,
-) -> int:
-    """Count how many read-type tool calls are in the conversation history."""
-    count = 0
-    for msg in messages:
-        if msg.get("role") == "assistant":
-            for tc in msg.get("tool_calls", []):
-                fn = tc.get("function", {})
-                name = fn.get("name", "")
-                if name in read_tools:
-                    count += 1
-    return count
-
-
-def _scope_tools_for_action(
+def filter_custom_tools(
     tools: list[dict[str, Any]],
-    read_count: int,
-    read_tools: frozenset[str] = DEFAULT_READ_TOOLS,
-    threshold: int = _READ_THRESHOLD,
-) -> tuple[list[dict[str, Any]], bool]:
-    """After N reads, strip read tools — force the model to edit or finish.
+    native_tools: frozenset[str] = DEFAULT_NATIVE_TOOLS,
+) -> list[dict[str, Any]]:
+    """Return only custom (non-native) tools that Claude can't call directly.
+
+    In hybrid mode, Claude handles file/shell operations through its built-in
+    tools. Only custom tools defined by the caller need to be described so
+    Claude knows to report them in pending_tool_calls.
+
+    Args:
+        tools: OpenAI-format tool definitions.
+        native_tools: Set of tool names handled natively by Claude. Defaults to
+            ``DEFAULT_NATIVE_TOOLS``.
 
     Returns:
-        Tuple of (scoped_tools, is_action_mode).
+        Filtered list containing only custom tools.
     """
-    if read_count < threshold:
-        return tools, False
-    action_tools = [
-        t for t in tools
-        if _get_tool_name(t) not in read_tools
-    ]
-    if action_tools:
-        return action_tools, True
-    return tools, False  # Don't strip if no action tools remain
+    return [t for t in tools if _get_tool_name(t) not in native_tools]
 
 
 def _get_tool_name(tool: dict[str, Any]) -> str:
@@ -102,25 +120,19 @@ def _get_tool_name(tool: dict[str, Any]) -> str:
 def build_prompt(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
-    read_tools: frozenset[str] | None = None,
-    read_threshold: int = _READ_THRESHOLD,
+    native_tools: frozenset[str] | None = None,
 ) -> str:
     """Flatten messages and tool descriptions into a single prompt string.
 
-    The claude CLI receives the full conversation as one prompt. This
-    function serialises system instructions, available tools (if any), and
-    the conversation history into that single string.
-
-    Dynamic tool scoping: after ``read_threshold`` read-type tool calls in
-    the conversation, read tools are stripped from the tool descriptions.
-    This forces the model to edit or finish rather than reading endlessly.
+    Hybrid mode: only describes custom (non-native) tools. Claude handles
+    file/shell operations through its own built-in tools (Bash, Edit, Read, Write).
+    Custom tools are described so Claude knows to report them in pending_tool_calls.
 
     Args:
         messages: OpenAI-format messages list.
         tools: OpenAI-format tool definitions, or None.
-        read_tools: Set of tool names considered "read-only". Defaults to
-            ``DEFAULT_READ_TOOLS``.
-        read_threshold: Number of reads before stripping. Default 3.
+        native_tools: Set of tool names handled natively by Claude. Defaults to
+            ``DEFAULT_NATIVE_TOOLS``.
 
     Returns:
         A single UTF-8 string suitable for piping to ``claude --print``.
@@ -128,33 +140,24 @@ def build_prompt(
     parts: list[str] = [_SYSTEM_PROMPT]
 
     if tools:
-        _rt = read_tools if read_tools is not None else DEFAULT_READ_TOOLS
-        read_count = _count_reads_in_messages(messages, _rt)
-        scoped, action_mode = _scope_tools_for_action(
-            tools, read_count, _rt, read_threshold
-        )
-        desc = _build_tool_descriptions(scoped)
-        parts.append(_TOOL_SECTION_TEMPLATE.format(tool_descriptions=desc))
-
-        if action_mode:
-            parts.append(
-                ">>> YOU HAVE READ ENOUGH. Read tools are no longer available. "
-                "Your ONLY options are edit/write/exec tools or "
-                '{"response": "..."}. Make an edit or finish. <<<'
-            )
+        _nt = native_tools if native_tools is not None else DEFAULT_NATIVE_TOOLS
+        custom = filter_custom_tools(tools, _nt)
+        if custom:
+            desc = _build_tool_descriptions(custom)
+            parts.append(_TOOL_SECTION_TEMPLATE.format(tool_descriptions=desc))
 
     parts.append("CONVERSATION HISTORY:")
     parts.append(_format_messages(messages))
-    parts.append("\nWhat is your next action? Respond with JSON only.")
+    parts.append(
+        "\nComplete the task using your built-in tools. "
+        "Report any custom tool calls in pending_tool_calls."
+    )
 
     return "\n".join(parts)
 
 
 def _build_tool_descriptions(tools: list[dict[str, Any]]) -> str:
     """Convert OpenAI tool schemas into a compact, human-readable list.
-
-    The model reads this to understand what tools are available and what
-    parameters they accept.
 
     Args:
         tools: List of OpenAI-format tool dicts, each with a ``"function"`` key.
@@ -239,8 +242,6 @@ def _format_messages(messages: list[dict[str, Any]]) -> str:
 def _extract_text(content: str | list[dict[str, Any]] | Any) -> str:
     """Extract plain text from an OpenAI content value.
 
-    Handles both plain string content and multimodal content arrays.
-
     Args:
         content: Either a string or a list of content blocks.
 
@@ -262,12 +263,24 @@ def _extract_text(content: str | list[dict[str, Any]] | Any) -> str:
 def parse_cli_output(stdout: str) -> dict[str, Any]:
     """Parse the claude CLI JSON envelope and extract an OpenAI-format response.
 
+    Hybrid mode: the CLI envelope now contains a ``structured_output`` field when
+    ``--json-schema`` is used. This field contains the structured response with
+    ``summary``, ``files_modified``, and ``pending_tool_calls``.
+
     The claude CLI with ``--output-format json`` returns an envelope like::
 
-        {"type": "result", "result": "<Claude's actual output>", "is_error": false, ...}
-
-    Claude's actual output is a JSON string (tool_calls or response object),
-    which we parse and convert to OpenAI wire format.
+        {
+            "type": "result",
+            "result": "",
+            "structured_output": {
+                "summary": "...",
+                "files_modified": [...],
+                "pending_tool_calls": [...],
+                "blocked": "..." (optional)
+            },
+            "is_error": false,
+            ...
+        }
 
     Args:
         stdout: Raw stdout from the claude subprocess.
@@ -297,86 +310,46 @@ def parse_cli_output(stdout: str) -> dict[str, Any]:
         error_text = envelope.get("result", "Unknown CLI error")
         raise ClaudeSubprocessError(f"claude CLI error: {error_text[:500]}")
 
-    # Extract the inner result string (what Claude actually wrote)
+    # Hybrid mode: extract structured_output field (present when --json-schema is used)
+    structured = envelope.get("structured_output")
+    if structured and isinstance(structured, dict):
+        return _parse_structured_output(structured)
+
+    # Fallback: try the result field (non-structured response or old invocation style)
     result_text = envelope.get("result", "")
     if not result_text:
         return _make_content_response("[CiC] Empty result in CLI envelope")
 
-    # Try to parse inner JSON
-    inner: dict[str, Any] = {}
-    try:
-        # Claude sometimes wraps its response in markdown code fences; strip them.
-        cleaned = _strip_code_fence(result_text)
-        inner = json.loads(cleaned)
-    except json.JSONDecodeError:
-        # CRITICAL FIX: Claude sometimes embeds JSON tool calls inside
-        # narrative text (e.g. "I'll edit the file now: {"tool_calls":...}")
-        # Extract the JSON object if it's embedded in text.
-        extracted = _extract_embedded_tool_calls(result_text)
-        if extracted is not None:
-            return extracted
-        # Not JSON and no embedded tool calls — treat as plain text answer
-        return _make_content_response(result_text)
-
-    # Convert to OpenAI format
-    tool_calls_raw = inner.get("tool_calls")
-    if tool_calls_raw and isinstance(tool_calls_raw, list):
-        return _make_tool_call_response(tool_calls_raw)
-
-    # Final answer
-    response_text = inner.get("response", inner.get("result", str(inner)))
-    return _make_content_response(response_text)
+    return _make_content_response(result_text)
 
 
-def _extract_embedded_tool_calls(text: str) -> dict[str, Any] | None:
-    """Extract JSON tool_calls from text that has narrative around it.
+def _parse_structured_output(structured: dict[str, Any]) -> dict[str, Any]:
+    """Convert structured output fields to OpenAI wire format.
 
-    Claude sometimes writes: 'I'll edit the file: {"tool_calls": [...]}'
-    or includes the JSON after explanatory text. This finds and parses it.
-
-    Returns:
-        An OpenAI-format response dict with tool_calls, or None if not found.
-    """
-    match = re.search(r'\{[^{}]*"tool_calls"\s*:\s*\[', text)
-    if not match:
-        return None
-
-    start = match.start()
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == '{':
-            depth += 1
-        elif text[i] == '}':
-            depth -= 1
-            if depth == 0:
-                try:
-                    obj = json.loads(text[start:i+1])
-                    tc = obj.get("tool_calls")
-                    if tc and isinstance(tc, list):
-                        return _make_tool_call_response(tc)
-                except json.JSONDecodeError:
-                    pass
-                break
-    return None
-
-
-def _strip_code_fence(text: str) -> str:
-    """Remove markdown code fences from a string if present.
-
-    Some model outputs wrap JSON in triple backticks. This strips the fences
-    so the inner content can be parsed as JSON.
+    - pending_tool_calls → OpenAI tool_calls (caller executes these custom tools)
+    - blocked → content response indicating task failure
+    - summary (no pending calls) → content response indicating completion
 
     Args:
-        text: Possibly fence-wrapped text.
+        structured: The structured_output dict from the CLI envelope.
 
     Returns:
-        The inner content if fences are found, otherwise the original text.
+        An OpenAI chat completion dict.
     """
-    stripped = text.strip()
-    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.DOTALL)
-    if match:
-        return match.group(1)
-    return stripped
+    summary = structured.get("summary", "")
+    pending_tool_calls = structured.get("pending_tool_calls", [])
+    blocked = structured.get("blocked", "")
+
+    # Blocked = task failed, report as content
+    if blocked:
+        return _make_content_response(f"[CiC] BLOCKED: {blocked}")
+
+    # pending_tool_calls → caller executes these custom tools
+    if pending_tool_calls and isinstance(pending_tool_calls, list):
+        return _make_tool_call_response(pending_tool_calls)
+
+    # No pending tool calls → task is done, return summary as content
+    return _make_content_response(summary or "[CiC] Task completed")
 
 
 def _make_content_response(text: str) -> dict[str, Any]:
@@ -400,10 +373,10 @@ def _make_content_response(text: str) -> dict[str, Any]:
 
 
 def _make_tool_call_response(tool_calls_raw: list[dict[str, Any]]) -> dict[str, Any]:
-    """Convert a CiC tool_calls list to OpenAI wire format.
+    """Convert a pending_tool_calls list to OpenAI wire format.
 
     Args:
-        tool_calls_raw: List of tool call dicts from Claude's JSON response.
+        tool_calls_raw: List of tool call dicts from Claude's structured output.
 
     Returns:
         An OpenAI chat completion dict with tool_calls.

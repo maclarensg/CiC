@@ -5,6 +5,14 @@ Instead of calling a REST API with per-token billing, it spawns
 ``claude --print`` subprocesses that use the caller's active Claude
 Pro/Max subscription.
 
+Hybrid mode: Claude keeps its built-in file tools (Bash, Edit, Read, Write) and
+executes file edits ITSELF inside the subprocess. Custom tools (defined by the
+caller) are reported back via ``--json-schema`` structured output in the
+``pending_tool_calls`` field. The agent loop then executes only those tools.
+
+This fixes the phantom edit bug where ``--tools ""`` caused Claude to return tool
+calls as narrative text (never executed), falsely marking tasks as done.
+
 Typical usage::
 
     from cic import CiCClient
@@ -16,10 +24,12 @@ Typical usage::
 For tool use (agent loops)::
 
     client = CiCClient(model="sonnet")
-    tools = [{"name": "read_file", "description": "...", "parameters": {...}}]
+    # Only define custom tools — file tools are handled by Claude natively
+    tools = [{"name": "notify_done", "description": "...", "parameters": {...}}]
 
     result = client.chat(messages, tools=tools)
     if result.has_tool_calls:
+        # These are custom tool calls from pending_tool_calls
         for tc in result.tool_calls:
             output = execute_tool(tc.name, tc.arguments)
             messages.append({"role": "tool", "name": tc.name, "content": output})
@@ -44,7 +54,14 @@ from typing import Any
 from .exceptions import ClaudeNotFoundError, ClaudeSubprocessError, ClaudeTimeoutError
 from .routing import CiCRouter, DEFAULT_ROUTING
 from .types import ChatResult, ToolCall, TokenUsage
-from .utils import build_prompt, estimate_tokens, extract_response_text, parse_cli_output
+from .utils import (
+    STRUCTURED_OUTPUT_SCHEMA,
+    _SYSTEM_PROMPT,
+    build_prompt,
+    estimate_tokens,
+    extract_response_text,
+    parse_cli_output,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +69,14 @@ logger = logging.getLogger(__name__)
 class CiCClient:
     """Chat client backed by the local ``claude`` CLI subprocess.
 
+    Hybrid mode: Claude executes file edits using its own built-in tools (Bash,
+    Edit, Read, Write). Custom tools defined by the caller are reported back via
+    ``--json-schema`` structured output and returned as ``tool_calls`` for the
+    caller to execute.
+
     Each call to ``chat()`` or ``achat()`` spawns a fresh ``claude --print``
     process, pipes the full conversation (system instructions + history +
-    tools) as stdin, and parses the JSON response.
+    custom tool descriptions) as stdin, and parses the structured JSON response.
 
     Args:
         model: Fixed model name (e.g. ``"sonnet"``). When set, routing is
@@ -307,14 +329,17 @@ class CiCClient:
             self._claude_path,
             "--print",
             "--output-format", "json",
-            "--tools", "",
+            # Hybrid mode: Claude uses its own file tools (Bash, Edit, Read, Write)
+            "--tools", "Bash,Edit,Read,Write",
+            # Structured output: summary + files_modified + pending_tool_calls
+            "--json-schema", STRUCTURED_OUTPUT_SCHEMA,
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--model", model,
             # Reduce ~45K → ~3K token cache tax per call
             "--setting-sources", "user",
-            "--system-prompt", "",
-            # Strip ALL MCP tools (e.g. Google Calendar) — only our text-described tools
+            "--system-prompt", _SYSTEM_PROMPT,
+            # Strip ALL MCP tools (e.g. Google Calendar)
             "--strict-mcp-config",
         ]
 
