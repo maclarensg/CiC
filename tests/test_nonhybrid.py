@@ -79,21 +79,11 @@ class TestNonHybridSchema:
         assert "file_read" in enum_values
         assert "file_edit" in enum_values
 
-    def test_done_always_in_enum(self):
-        schema_str = build_non_hybrid_schema([])
-        schema = json.loads(schema_str)
-        assert "done" in schema["properties"]["action"]["enum"]
-
-    def test_blocked_always_in_enum(self):
-        schema_str = build_non_hybrid_schema([])
-        schema = json.loads(schema_str)
-        assert "blocked" in schema["properties"]["action"]["enum"]
-
-    def test_empty_tools_only_terminal_actions(self):
+    def test_empty_tools_empty_enum(self):
         schema_str = build_non_hybrid_schema([])
         schema = json.loads(schema_str)
         enum_values = schema["properties"]["action"]["enum"]
-        assert set(enum_values) == {"done", "blocked"}
+        assert enum_values == []  # No tools, no done/blocked — empty enum
 
     def test_required_fields_in_schema(self):
         schema_str = build_non_hybrid_schema([])
@@ -151,8 +141,8 @@ class TestNonHybridSchema:
         assert "tool_a" in enum_values
         assert "tool_b" in enum_values
         assert "tool_c" in enum_values
-        assert "done" in enum_values
-        assert "blocked" in enum_values
+        # Only tool names — no done/blocked
+        assert set(enum_values) == {"tool_a", "tool_b", "tool_c"}
 
 
 # ---------------------------------------------------------------------------
@@ -221,88 +211,10 @@ class TestNonHybridParsing:
         tc = data["choices"][0]["message"]["tool_calls"][0]
         assert tc["function"]["name"] == "run_tests"
 
-    def test_done_action_returns_content_response(self):
-        stdout = _non_hybrid_envelope(
-            action="done",
-            arguments={},
-            reasoning="All changes complete",
-        )
-        data = parse_cli_output(stdout, hybrid=False)
-        message = data["choices"][0]["message"]
-        assert message.get("tool_calls") is None or message.get("tool_calls") == []
-        assert message["content"] is not None
-
-    def test_done_action_with_reason_in_arguments(self):
-        stdout = _non_hybrid_envelope(
-            action="done",
-            arguments={"reason": "Task is finished successfully"},
-        )
-        data = parse_cli_output(stdout, hybrid=False)
-        content = data["choices"][0]["message"]["content"]
-        assert "Task is finished successfully" in content
-
-    def test_done_action_falls_back_to_reasoning(self):
-        stdout = _non_hybrid_envelope(
-            action="done",
-            arguments={},
-            reasoning="All done here",
-        )
-        data = parse_cli_output(stdout, hybrid=False)
-        content = data["choices"][0]["message"]["content"]
-        assert "All done here" in content
-
-    def test_blocked_action_returns_content_with_blocked_prefix(self):
-        stdout = _non_hybrid_envelope(
-            action="blocked",
-            arguments={"reason": "File does not exist"},
-        )
-        data = parse_cli_output(stdout, hybrid=False)
-        content = data["choices"][0]["message"]["content"]
-        assert "BLOCKED" in content
-
-    def test_blocked_action_includes_reason(self):
-        stdout = _non_hybrid_envelope(
-            action="blocked",
-            arguments={"reason": "Cannot find the target function"},
-        )
-        data = parse_cli_output(stdout, hybrid=False)
-        content = data["choices"][0]["message"]["content"]
-        assert "Cannot find the target function" in content
-
-    def test_blocked_falls_back_to_reasoning(self):
-        stdout = _non_hybrid_envelope(
-            action="blocked",
-            arguments={},
-            reasoning="No such file",
-        )
-        data = parse_cli_output(stdout, hybrid=False)
-        content = data["choices"][0]["message"]["content"]
-        assert "No such file" in content
-
-    def test_missing_action_field_returns_error_content(self):
-        """Malformed structured_output with no action field."""
-        stdout = json.dumps({
-            "type": "result",
-            "result": "",
-            "is_error": False,
-            "structured_output": {
-                "arguments": {},
-                "reasoning": "oops",
-            },
-        })
-        data = parse_cli_output(stdout, hybrid=False)
-        content = data["choices"][0]["message"]["content"]
-        assert "[CiC]" in content
-
     def test_finish_reason_tool_calls_for_action(self):
         stdout = _non_hybrid_envelope(action="file_read", arguments={"path": "/x"})
         data = parse_cli_output(stdout, hybrid=False)
         assert data["choices"][0]["finish_reason"] == "tool_calls"
-
-    def test_finish_reason_stop_for_done(self):
-        stdout = _non_hybrid_envelope(action="done")
-        data = parse_cli_output(stdout, hybrid=False)
-        assert data["choices"][0]["finish_reason"] == "stop"
 
     def test_arguments_dict_preserved(self):
         """Arguments dict comes back as serialized JSON in OpenAI format."""
@@ -559,7 +471,7 @@ class TestNonHybridClientSubprocess:
         enum_values = schema["properties"]["action"]["enum"]
         assert "file_read" in enum_values
         assert "file_edit" in enum_values
-        assert "done" in enum_values
+        assert len(enum_values) > 0  # no done/blocked, only tool names
 
     @pytest.mark.asyncio
     async def test_non_hybrid_uses_non_hybrid_system_prompt(self):
@@ -617,28 +529,6 @@ class TestNonHybridChatResults:
         assert result.tool_calls[0].name == "file_edit"
         assert result.tool_calls[0].arguments["old_string"] == "bug"
         assert result.tool_calls[0].arguments["new_string"] == "fix"
-
-    @pytest.mark.asyncio
-    async def test_done_action_returns_content(self):
-        client = _make_client(model="sonnet", hybrid=False)
-        client._spawn_claude = _mock_spawn(
-            _non_hybrid_envelope("done", {}, reasoning="Task is complete")
-        )
-        result = await client.achat([{"role": "user", "content": "Fix bug"}])
-        assert not result.has_tool_calls
-        assert result.content is not None
-        assert result.tool_calls == []
-
-    @pytest.mark.asyncio
-    async def test_blocked_action_returns_content(self):
-        client = _make_client(model="sonnet", hybrid=False)
-        client._spawn_claude = _mock_spawn(
-            _non_hybrid_envelope("blocked", {"reason": "File not found"})
-        )
-        result = await client.achat([{"role": "user", "content": "Fix bug"}])
-        assert not result.has_tool_calls
-        assert result.content is not None
-        assert "BLOCKED" in result.content
 
     @pytest.mark.asyncio
     async def test_shell_exec_action_returns_tool_call(self):

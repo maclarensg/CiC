@@ -48,7 +48,7 @@ one action per response.
 
 The calling application will execute your chosen action and return the result.
 You then decide the next action based on that result. Continue until the task
-is complete (action: "done") or you are blocked (action: "blocked").
+requires no more action. You MUST pick a tool — there is no "done" option.
 
 IMPORTANT:
 1. Output ONE action per response — not multiple.
@@ -120,8 +120,10 @@ DEFAULT_NATIVE_TOOLS = frozenset({
     "read_file", "write_file", "edit_file", "exec_command",
 })
 
-# Terminal actions available to Claude in non-hybrid mode regardless of tool list.
-_NON_HYBRID_TERMINAL_ACTIONS = ("done", "blocked")
+# No terminal actions in enum — forces Claude to pick a real tool every time.
+# When "done"/"blocked" are available, Claude uses them as escape hatches
+# and never calls file_edit. Removing them achieves 100% tool call rate.
+_NON_HYBRID_TERMINAL_ACTIONS: tuple[str, ...] = ()
 
 
 def filter_custom_tools(
@@ -156,7 +158,7 @@ def build_non_hybrid_schema(tools: list[dict[str, Any]]) -> str:
 
     Non-hybrid mode uses an action-enum schema so every response is a single
     structured tool call decision. The schema enum is built from the caller's
-    tool names plus the terminal actions "done" and "blocked".
+    tool names only — no "done" or "blocked" escape hatches.
 
     Args:
         tools: OpenAI-format tool definitions.
@@ -173,10 +175,7 @@ def build_non_hybrid_schema(tools: list[dict[str, Any]]) -> str:
             "action": {
                 "type": "string",
                 "enum": enum_values,
-                "description": (
-                    "The tool to call, or 'done' when the task is complete, "
-                    "or 'blocked' if you cannot proceed."
-                ),
+                "description": "The tool to call. You MUST pick one.",
             },
             "arguments": {
                 "type": "object",
@@ -518,33 +517,19 @@ def _parse_structured_output(structured: dict[str, Any]) -> dict[str, Any]:
 def _parse_non_hybrid_structured_output(structured: dict[str, Any]) -> dict[str, Any]:
     """Convert non-hybrid mode action-enum structured output to OpenAI wire format.
 
-    The non-hybrid schema outputs one action per call:
-    - action="done" → content response (task complete)
-    - action="blocked" → content response with blocked reason
-    - action=<tool_name> → OpenAI tool_call for the caller to execute
+    Every response is a tool call — no "done" or "blocked" escape hatches.
+    The caller (agent loop) handles termination via max iterations.
 
     Args:
         structured: The structured_output dict from the CLI envelope.
             Expected keys: action, arguments, reasoning.
 
     Returns:
-        An OpenAI chat completion dict.
+        An OpenAI chat completion dict with exactly one tool_call.
     """
     action = structured.get("action", "")
     arguments = structured.get("arguments", {})
     reasoning = structured.get("reasoning", "")
-
-    if not action:
-        return _make_content_response("[CiC] Non-hybrid response missing action field")
-
-    # Terminal actions → return as content
-    if action == "done":
-        reason = arguments.get("reason", reasoning) if isinstance(arguments, dict) else reasoning
-        return _make_content_response(reason or "[CiC] Task completed")
-
-    if action == "blocked":
-        reason = arguments.get("reason", reasoning) if isinstance(arguments, dict) else reasoning
-        return _make_content_response(f"[CiC] BLOCKED: {reason or 'No reason provided'}")
 
     # Tool action → return as OpenAI tool_call
     args = arguments if isinstance(arguments, dict) else {}
