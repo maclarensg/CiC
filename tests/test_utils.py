@@ -492,3 +492,37 @@ class TestBuildPromptDynamicScoping:
         prompt = build_prompt(msgs, tools, read_threshold=3)
         assert "READ ENOUGH" not in prompt
         assert "file_read" in prompt
+
+
+class TestExtractEmbeddedToolCalls:
+    def test_extracts_from_narrative_text(self):
+        from cic.utils import _extract_embedded_tool_calls
+        text = 'I will edit the file now: {"tool_calls": [{"id": "call_1", "name": "file_edit", "arguments": {"path": "foo.py", "old_string": "old", "new_string": "new"}}]}'
+        result = _extract_embedded_tool_calls(text)
+        assert result is not None
+        tc = result["choices"][0]["message"]["tool_calls"]
+        assert len(tc) == 1
+        assert tc[0]["function"]["name"] == "file_edit"
+
+    def test_returns_none_for_no_tool_calls(self):
+        from cic.utils import _extract_embedded_tool_calls
+        assert _extract_embedded_tool_calls("just plain text") is None
+
+    def test_extracts_from_multiline_narrative(self):
+        from cic.utils import _extract_embedded_tool_calls
+        text = """Here is what I plan to do:
+1. Read the file
+2. Edit it
+
+{"tool_calls": [{"id": "call_1", "name": "shell_exec", "arguments": {"command": "pytest"}}]}
+
+That should fix the issue."""
+        result = _extract_embedded_tool_calls(text)
+        assert result is not None
+        tc = result["choices"][0]["message"]["tool_calls"]
+        assert tc[0]["function"]["name"] == "shell_exec"
+
+    def test_handles_malformed_json(self):
+        from cic.utils import _extract_embedded_tool_calls
+        text = 'broken: {"tool_calls": [{"incomplete'
+        assert _extract_embedded_tool_calls(text) is None

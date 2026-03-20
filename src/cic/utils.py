@@ -309,7 +309,13 @@ def parse_cli_output(stdout: str) -> dict[str, Any]:
         cleaned = _strip_code_fence(result_text)
         inner = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Not JSON — treat as a plain text answer
+        # CRITICAL FIX: Claude sometimes embeds JSON tool calls inside
+        # narrative text (e.g. "I'll edit the file now: {"tool_calls":...}")
+        # Extract the JSON object if it's embedded in text.
+        extracted = _extract_embedded_tool_calls(result_text)
+        if extracted is not None:
+            return extracted
+        # Not JSON and no embedded tool calls — treat as plain text answer
         return _make_content_response(result_text)
 
     # Convert to OpenAI format
@@ -320,6 +326,38 @@ def parse_cli_output(stdout: str) -> dict[str, Any]:
     # Final answer
     response_text = inner.get("response", inner.get("result", str(inner)))
     return _make_content_response(response_text)
+
+
+def _extract_embedded_tool_calls(text: str) -> dict[str, Any] | None:
+    """Extract JSON tool_calls from text that has narrative around it.
+
+    Claude sometimes writes: 'I'll edit the file: {"tool_calls": [...]}'
+    or includes the JSON after explanatory text. This finds and parses it.
+
+    Returns:
+        An OpenAI-format response dict with tool_calls, or None if not found.
+    """
+    match = re.search(r'\{[^{}]*"tool_calls"\s*:\s*\[', text)
+    if not match:
+        return None
+
+    start = match.start()
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(text[start:i+1])
+                    tc = obj.get("tool_calls")
+                    if tc and isinstance(tc, list):
+                        return _make_tool_call_response(tc)
+                except json.JSONDecodeError:
+                    pass
+                break
+    return None
 
 
 def _strip_code_fence(text: str) -> str:
