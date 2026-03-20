@@ -5,6 +5,11 @@ Read, Write). Custom tools (defined by the caller) are reported back via structu
 output in the pending_tool_calls field. The agent loop executes those after Claude
 finishes.
 
+Non-hybrid mode: Claude has NO built-in tools (--tools ""). Instead, it outputs ONE
+action per call via --json-schema with an action-enum schema. The caller executes
+every tool — including file operations — and calls chat() again with the result.
+This gives the caller full control and verifiability over every operation.
+
 These helpers are not part of the public API but are tested directly
 because the prompt/parse logic is critical to correct behaviour.
 """
@@ -34,13 +39,39 @@ IMPORTANT:
 4. If you cannot complete the task, explain why in the blocked field.
 """
 
+# System prompt for non-hybrid mode.
+# Claude has NO built-in tools — every action must be expressed as a structured output.
+_NON_HYBRID_SYSTEM_PROMPT = """\
+You are an AI agent operating in tool-execution mode. You have NO built-in tools.
+Every action you take must be expressed as a structured JSON output with exactly
+one action per response.
+
+The calling application will execute your chosen action and return the result.
+You then decide the next action based on that result. Continue until the task
+is complete (action: "done") or you are blocked (action: "blocked").
+
+IMPORTANT:
+1. Output ONE action per response — not multiple.
+2. Choose the action that directly moves the task forward.
+3. For file edits: use file_read first to get the current content, then file_edit.
+4. For file_edit, the old_string MUST exactly match the current file content.
+5. Use "done" only when the task is fully complete.
+6. Use "blocked" only when you cannot proceed (include the reason in reasoning).
+"""
+
 _TOOL_SECTION_TEMPLATE = """\
 CUSTOM TOOLS (report in pending_tool_calls — do NOT describe as text):
 {tool_descriptions}
 
 """
 
-# The JSON schema for structured output.
+_NON_HYBRID_TOOL_SECTION_TEMPLATE = """\
+AVAILABLE TOOLS (use these via the action field):
+{tool_descriptions}
+
+"""
+
+# The JSON schema for structured output in hybrid mode.
 # The caller fills this in with what Claude did and what custom tools to run next.
 STRUCTURED_OUTPUT_SCHEMA = json.dumps({
     "type": "object",
@@ -89,6 +120,9 @@ DEFAULT_NATIVE_TOOLS = frozenset({
     "read_file", "write_file", "edit_file", "exec_command",
 })
 
+# Terminal actions available to Claude in non-hybrid mode regardless of tool list.
+_NON_HYBRID_TERMINAL_ACTIONS = ("done", "blocked")
+
 
 def filter_custom_tools(
     tools: list[dict[str, Any]],
@@ -117,10 +151,57 @@ def _get_tool_name(tool: dict[str, Any]) -> str:
     return fn.get("name", "")
 
 
+def build_non_hybrid_schema(tools: list[dict[str, Any]]) -> str:
+    """Build a --json-schema that constrains Claude to call only the provided tools.
+
+    Non-hybrid mode uses an action-enum schema so every response is a single
+    structured tool call decision. The schema enum is built from the caller's
+    tool names plus the terminal actions "done" and "blocked".
+
+    Args:
+        tools: OpenAI-format tool definitions.
+
+    Returns:
+        A JSON string suitable for passing to ``--json-schema``.
+    """
+    tool_names = [_get_tool_name(t) for t in tools if _get_tool_name(t)]
+    enum_values = tool_names + list(_NON_HYBRID_TERMINAL_ACTIONS)
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": enum_values,
+                "description": (
+                    "The tool to call, or 'done' when the task is complete, "
+                    "or 'blocked' if you cannot proceed."
+                ),
+            },
+            "arguments": {
+                "type": "object",
+                "description": (
+                    "Tool arguments. For file_edit: {path, old_string, new_string}. "
+                    "For file_read: {path}. For shell_exec: {command}. "
+                    "For done/blocked: {} or {reason}."
+                ),
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Brief reasoning for this action choice.",
+            },
+        },
+        "required": ["action", "arguments", "reasoning"],
+    }
+    return json.dumps(schema)
+
+
 def build_prompt(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     native_tools: frozenset[str] | None = None,
+    *,
+    hybrid: bool = True,
 ) -> str:
     """Flatten messages and tool descriptions into a single prompt string.
 
@@ -128,15 +209,23 @@ def build_prompt(
     file/shell operations through its own built-in tools (Bash, Edit, Read, Write).
     Custom tools are described so Claude knows to report them in pending_tool_calls.
 
+    Non-hybrid mode: describes ALL tools (Claude cannot call any of them directly).
+    Each call returns one action for the caller to execute.
+
     Args:
         messages: OpenAI-format messages list.
         tools: OpenAI-format tool definitions, or None.
         native_tools: Set of tool names handled natively by Claude. Defaults to
-            ``DEFAULT_NATIVE_TOOLS``.
+            ``DEFAULT_NATIVE_TOOLS``. Ignored in non-hybrid mode.
+        hybrid: When True (default), uses hybrid mode prompt. When False, uses
+            non-hybrid mode prompt where all tools are described.
 
     Returns:
         A single UTF-8 string suitable for piping to ``claude --print``.
     """
+    if not hybrid:
+        return _build_non_hybrid_prompt(messages, tools)
+
     parts: list[str] = [_SYSTEM_PROMPT]
 
     if tools:
@@ -151,6 +240,38 @@ def build_prompt(
     parts.append(
         "\nComplete the task using your built-in tools. "
         "Report any custom tool calls in pending_tool_calls."
+    )
+
+    return "\n".join(parts)
+
+
+def _build_non_hybrid_prompt(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> str:
+    """Build a prompt for non-hybrid mode.
+
+    All tools are described — Claude cannot call any of them directly.
+    The output is one action per call.
+
+    Args:
+        messages: OpenAI-format messages list.
+        tools: OpenAI-format tool definitions, or None.
+
+    Returns:
+        A single UTF-8 string suitable for piping to ``claude --print``.
+    """
+    parts: list[str] = [_NON_HYBRID_SYSTEM_PROMPT]
+
+    if tools:
+        desc = _build_tool_descriptions_with_params(tools)
+        parts.append(_NON_HYBRID_TOOL_SECTION_TEMPLATE.format(tool_descriptions=desc))
+
+    parts.append("CONVERSATION HISTORY:")
+    parts.append(_format_messages(messages))
+    parts.append(
+        "\nDecide the single next action to take. "
+        "Output exactly one action in the structured JSON format."
     )
 
     return "\n".join(parts)
@@ -181,6 +302,46 @@ def _build_tool_descriptions(tools: list[dict[str, Any]]) -> str:
 
         param_str = ", ".join(param_parts) if param_parts else ""
         lines.append(f"- {name}({param_str}): {description}")
+
+    return "\n".join(lines)
+
+
+def _build_tool_descriptions_with_params(tools: list[dict[str, Any]]) -> str:
+    """Convert OpenAI tool schemas into a detailed, human-readable list.
+
+    Used in non-hybrid mode where Claude needs full parameter information
+    to produce correct arguments without being able to call tools directly.
+
+    Args:
+        tools: List of OpenAI-format tool dicts.
+
+    Returns:
+        A newline-separated string with name, description, and parameter details.
+    """
+    lines: list[str] = []
+    for tool in tools:
+        fn = tool.get("function", tool)
+        name = fn.get("name", "unknown")
+        description = fn.get("description", "")
+        params = fn.get("parameters", {}).get("properties", {})
+        required = set(fn.get("parameters", {}).get("required", []))
+
+        param_parts: list[str] = []
+        for param_name, param_schema in params.items():
+            param_type = param_schema.get("type", "any")
+            param_desc = param_schema.get("description", "")
+            suffix = "" if param_name in required else "?"
+            if param_desc:
+                param_parts.append(f"    {param_name}{suffix} ({param_type}): {param_desc}")
+            else:
+                param_parts.append(f"    {param_name}{suffix} ({param_type})")
+
+        if param_parts:
+            params_str = "\n" + "\n".join(param_parts)
+        else:
+            params_str = " (no parameters)"
+
+        lines.append(f"- {name}: {description}{params_str}")
 
     return "\n".join(lines)
 
@@ -260,30 +421,29 @@ def _extract_text(content: str | list[dict[str, Any]] | Any) -> str:
     return str(content)
 
 
-def parse_cli_output(stdout: str) -> dict[str, Any]:
+def parse_cli_output(stdout: str, *, hybrid: bool = True) -> dict[str, Any]:
     """Parse the claude CLI JSON envelope and extract an OpenAI-format response.
 
-    Hybrid mode: the CLI envelope now contains a ``structured_output`` field when
-    ``--json-schema`` is used. This field contains the structured response with
+    Hybrid mode: the CLI envelope contains a ``structured_output`` field with
     ``summary``, ``files_modified``, and ``pending_tool_calls``.
+
+    Non-hybrid mode: the CLI envelope contains a ``structured_output`` field with
+    ``action``, ``arguments``, and ``reasoning`` (the action-enum schema).
 
     The claude CLI with ``--output-format json`` returns an envelope like::
 
         {
             "type": "result",
             "result": "",
-            "structured_output": {
-                "summary": "...",
-                "files_modified": [...],
-                "pending_tool_calls": [...],
-                "blocked": "..." (optional)
-            },
+            "structured_output": { ... },
             "is_error": false,
             ...
         }
 
     Args:
         stdout: Raw stdout from the claude subprocess.
+        hybrid: When True (default), parses hybrid mode structured output.
+            When False, parses non-hybrid mode action-enum structured output.
 
     Returns:
         An OpenAI-format chat completion dict.
@@ -310,10 +470,13 @@ def parse_cli_output(stdout: str) -> dict[str, Any]:
         error_text = envelope.get("result", "Unknown CLI error")
         raise ClaudeSubprocessError(f"claude CLI error: {error_text[:500]}")
 
-    # Hybrid mode: extract structured_output field (present when --json-schema is used)
+    # Extract structured_output field (present when --json-schema is used)
     structured = envelope.get("structured_output")
     if structured and isinstance(structured, dict):
-        return _parse_structured_output(structured)
+        if hybrid:
+            return _parse_structured_output(structured)
+        else:
+            return _parse_non_hybrid_structured_output(structured)
 
     # Fallback: try the result field (non-structured response or old invocation style)
     result_text = envelope.get("result", "")
@@ -324,7 +487,7 @@ def parse_cli_output(stdout: str) -> dict[str, Any]:
 
 
 def _parse_structured_output(structured: dict[str, Any]) -> dict[str, Any]:
-    """Convert structured output fields to OpenAI wire format.
+    """Convert hybrid mode structured output fields to OpenAI wire format.
 
     - pending_tool_calls → OpenAI tool_calls (caller executes these custom tools)
     - blocked → content response indicating task failure
@@ -350,6 +513,43 @@ def _parse_structured_output(structured: dict[str, Any]) -> dict[str, Any]:
 
     # No pending tool calls → task is done, return summary as content
     return _make_content_response(summary or "[CiC] Task completed")
+
+
+def _parse_non_hybrid_structured_output(structured: dict[str, Any]) -> dict[str, Any]:
+    """Convert non-hybrid mode action-enum structured output to OpenAI wire format.
+
+    The non-hybrid schema outputs one action per call:
+    - action="done" → content response (task complete)
+    - action="blocked" → content response with blocked reason
+    - action=<tool_name> → OpenAI tool_call for the caller to execute
+
+    Args:
+        structured: The structured_output dict from the CLI envelope.
+            Expected keys: action, arguments, reasoning.
+
+    Returns:
+        An OpenAI chat completion dict.
+    """
+    action = structured.get("action", "")
+    arguments = structured.get("arguments", {})
+    reasoning = structured.get("reasoning", "")
+
+    if not action:
+        return _make_content_response("[CiC] Non-hybrid response missing action field")
+
+    # Terminal actions → return as content
+    if action == "done":
+        reason = arguments.get("reason", reasoning) if isinstance(arguments, dict) else reasoning
+        return _make_content_response(reason or "[CiC] Task completed")
+
+    if action == "blocked":
+        reason = arguments.get("reason", reasoning) if isinstance(arguments, dict) else reasoning
+        return _make_content_response(f"[CiC] BLOCKED: {reason or 'No reason provided'}")
+
+    # Tool action → return as OpenAI tool_call
+    args = arguments if isinstance(arguments, dict) else {}
+    tool_call = {"name": action, "arguments": args}
+    return _make_tool_call_response([tool_call])
 
 
 def _make_content_response(text: str) -> dict[str, Any]:

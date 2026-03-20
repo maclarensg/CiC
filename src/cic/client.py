@@ -5,13 +5,22 @@ Instead of calling a REST API with per-token billing, it spawns
 ``claude --print`` subprocesses that use the caller's active Claude
 Pro/Max subscription.
 
-Hybrid mode: Claude keeps its built-in file tools (Bash, Edit, Read, Write) and
-executes file edits ITSELF inside the subprocess. Custom tools (defined by the
-caller) are reported back via ``--json-schema`` structured output in the
-``pending_tool_calls`` field. The agent loop then executes only those tools.
+Two modes are available:
+
+**Hybrid mode** (default, ``hybrid=True``): Claude keeps its built-in file tools
+(Bash, Edit, Read, Write) and executes file edits ITSELF inside the subprocess.
+Custom tools (defined by the caller) are reported back via ``--json-schema``
+structured output in the ``pending_tool_calls`` field. The agent loop then
+executes only those tools.
 
 This fixes the phantom edit bug where ``--tools ""`` caused Claude to return tool
 calls as narrative text (never executed), falsely marking tasks as done.
+
+**Non-hybrid mode** (``hybrid=False``): Claude has NO built-in tools. Instead,
+it outputs ONE action per call via ``--json-schema`` with an action-enum schema.
+The caller executes every tool — including file operations — and calls ``chat()``
+again with the result. This gives the caller full control and verifiability over
+every operation at the cost of more round-trips.
 
 Typical usage::
 
@@ -21,7 +30,7 @@ Typical usage::
     result = client.chat([{"role": "user", "content": "Hello!"}])
     print(result.content)
 
-For tool use (agent loops)::
+For hybrid mode (agent loops with custom tools)::
 
     client = CiCClient(model="sonnet")
     # Only define custom tools — file tools are handled by Claude natively
@@ -34,6 +43,24 @@ For tool use (agent loops)::
             output = execute_tool(tc.name, tc.arguments)
             messages.append({"role": "tool", "name": tc.name, "content": output})
         result = client.chat(messages, tools=tools)
+
+For non-hybrid mode (full caller control)::
+
+    client = CiCClient(model="sonnet", hybrid=False)
+    # Define ALL tools — Claude cannot call any of them directly
+    tools = [
+        {"name": "file_read", "description": "Read a file", ...},
+        {"name": "file_edit", "description": "Edit a file", ...},
+        {"name": "shell_exec", "description": "Run a command", ...},
+    ]
+
+    result = client.chat(messages, tools=tools)
+    while result.has_tool_calls:
+        for tc in result.tool_calls:
+            output = execute_tool(tc.name, tc.arguments)
+            messages.append({"role": "tool", "name": tc.name, "content": output})
+        result = client.chat(messages, tools=tools)
+    # result.content is the final answer ("done" action)
 
 For smart routing::
 
@@ -56,7 +83,9 @@ from .routing import CiCRouter, DEFAULT_ROUTING
 from .types import ChatResult, ToolCall, TokenUsage
 from .utils import (
     STRUCTURED_OUTPUT_SCHEMA,
+    _NON_HYBRID_SYSTEM_PROMPT,
     _SYSTEM_PROMPT,
+    build_non_hybrid_schema,
     build_prompt,
     estimate_tokens,
     extract_response_text,
@@ -69,14 +98,23 @@ logger = logging.getLogger(__name__)
 class CiCClient:
     """Chat client backed by the local ``claude`` CLI subprocess.
 
-    Hybrid mode: Claude executes file edits using its own built-in tools (Bash,
-    Edit, Read, Write). Custom tools defined by the caller are reported back via
-    ``--json-schema`` structured output and returned as ``tool_calls`` for the
-    caller to execute.
+    Two modes:
+
+    **Hybrid mode** (default, ``hybrid=True``): Claude executes file edits using
+    its own built-in tools (Bash, Edit, Read, Write). Custom tools defined by the
+    caller are reported back via ``--json-schema`` structured output and returned
+    as ``tool_calls`` for the caller to execute.
+
+    **Non-hybrid mode** (``hybrid=False``): Claude has NO built-in tools. Each
+    ``chat()`` call returns ONE action (a tool call decision) for the caller to
+    execute. The caller passes the result back in the next call. This continues
+    until Claude outputs ``action: "done"`` (returns content) or ``action:
+    "blocked"``. All tools — including file operations — are executed by the
+    caller, giving full control and verifiability.
 
     Each call to ``chat()`` or ``achat()`` spawns a fresh ``claude --print``
     process, pipes the full conversation (system instructions + history +
-    custom tool descriptions) as stdin, and parses the structured JSON response.
+    tool descriptions) as stdin, and parses the structured JSON response.
 
     Args:
         model: Fixed model name (e.g. ``"sonnet"``). When set, routing is
@@ -87,6 +125,9 @@ class CiCClient:
         timeout: Subprocess timeout in seconds. Default: 120.
         claude_path: Explicit path to the ``claude`` binary. Auto-detected
             from PATH when not provided.
+        hybrid: When True (default), uses hybrid mode — Claude edits files
+            directly with its built-in tools. When False, uses non-hybrid mode —
+            Claude decides actions, caller executes every tool.
 
     Raises:
         ClaudeNotFoundError: If ``claude`` is not found in PATH and
@@ -100,10 +141,12 @@ class CiCClient:
         routing: dict[str, str] | None = None,
         timeout: float = 120.0,
         claude_path: str | None = None,
+        hybrid: bool = True,
     ) -> None:
         self._fixed_model = model
         self._timeout = timeout
         self._current_complexity = "moderate"
+        self._hybrid = hybrid
 
         # Set up routing
         if routing:
@@ -119,10 +162,15 @@ class CiCClient:
                 "Install Claude Code: npm install -g @anthropic-ai/claude-code"
             )
 
+        mode = "hybrid" if self._hybrid else "non-hybrid"
         if self._fixed_model:
-            logger.info("[CiC] Fixed model: %s (routing disabled)", self._fixed_model)
+            logger.info(
+                "[CiC] Fixed model: %s (routing disabled, mode=%s)",
+                self._fixed_model,
+                mode,
+            )
         else:
-            logger.info("[CiC] Smart routing enabled: %s", self._router)
+            logger.info("[CiC] Smart routing enabled: %s (mode=%s)", self._router, mode)
 
     # ------------------------------------------------------------------
     # Public properties
@@ -265,23 +313,24 @@ class CiCClient:
             ClaudeSubprocessError: If the CLI returns an error response.
         """
         model = self.active_model
-        prompt = build_prompt(messages, tools)
+        prompt = build_prompt(messages, tools, hybrid=self._hybrid)
         prompt_tokens = estimate_tokens(prompt)
 
         logger.info(
-            "[CiC] Spawning %s (~%d tok prompt, complexity=%s, timeout=%ds)",
+            "[CiC] Spawning %s (~%d tok prompt, complexity=%s, timeout=%ds, mode=%s)",
             model,
             prompt_tokens,
             self._current_complexity,
             int(self._timeout),
+            "hybrid" if self._hybrid else "non-hybrid",
         )
 
-        stdout, stderr = await self._spawn_claude(prompt, model)
+        stdout, stderr = await self._spawn_claude(prompt, model, tools=tools)
 
         if stderr:
             logger.debug("[CiC] stderr: %.500s", stderr)
 
-        data = parse_cli_output(stdout)
+        data = parse_cli_output(stdout, hybrid=self._hybrid)
         response_text = extract_response_text(data)
         completion_tokens = estimate_tokens(response_text)
 
@@ -308,15 +357,24 @@ class CiCClient:
         self,
         prompt: str,
         model: str,
+        tools: list[dict] | None = None,
     ) -> tuple[str, str]:
         """Spawn the claude CLI and return (stdout, stderr).
 
         The prompt is piped to stdin. The CLI writes its JSON response to
         stdout. stderr carries diagnostic output (not part of the response).
 
+        In hybrid mode: uses ``--tools Bash,Edit,Read,Write`` and the hybrid
+        structured output schema (summary + files_modified + pending_tool_calls).
+
+        In non-hybrid mode: uses ``--tools ""`` (no built-in tools) and the
+        action-enum schema built from the caller's tool definitions.
+
         Args:
             prompt: The full prompt string to pipe to the subprocess.
             model: The model flag value, e.g. ``"sonnet"``.
+            tools: Tool definitions used to build the non-hybrid schema.
+                Ignored in hybrid mode.
 
         Returns:
             A tuple of ``(stdout, stderr)`` as decoded strings.
@@ -325,20 +383,27 @@ class CiCClient:
             ClaudeTimeoutError: If the subprocess does not complete within
                 ``self._timeout`` seconds.
         """
+        if self._hybrid:
+            tools_flag = "Bash,Edit,Read,Write"
+            schema = STRUCTURED_OUTPUT_SCHEMA
+            system_prompt = _SYSTEM_PROMPT
+        else:
+            tools_flag = ""
+            schema = build_non_hybrid_schema(tools or [])
+            system_prompt = _NON_HYBRID_SYSTEM_PROMPT
+
         cmd = [
             self._claude_path,
             "--print",
             "--output-format", "json",
-            # Hybrid mode: Claude uses its own file tools (Bash, Edit, Read, Write)
-            "--tools", "Bash,Edit,Read,Write",
-            # Structured output: summary + files_modified + pending_tool_calls
-            "--json-schema", STRUCTURED_OUTPUT_SCHEMA,
+            "--tools", tools_flag,
+            "--json-schema", schema,
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--model", model,
             # Reduce ~45K → ~3K token cache tax per call
             "--setting-sources", "user",
-            "--system-prompt", _SYSTEM_PROMPT,
+            "--system-prompt", system_prompt,
             # Strip ALL MCP tools (e.g. Google Calendar)
             "--strict-mcp-config",
         ]
@@ -389,12 +454,16 @@ class CiCClient:
         pass  # No resources to release
 
     def __repr__(self) -> str:
+        mode = "hybrid" if self._hybrid else "non-hybrid"
         if self._fixed_model:
-            return f"CiCClient(model={self._fixed_model!r}, timeout={self._timeout})"
+            return (
+                f"CiCClient(model={self._fixed_model!r}, "
+                f"timeout={self._timeout}, mode={mode!r})"
+            )
         return (
             f"CiCClient(routing={self._router!r}, "
             f"complexity={self._current_complexity!r}, "
-            f"timeout={self._timeout})"
+            f"timeout={self._timeout}, mode={mode!r})"
         )
 
 

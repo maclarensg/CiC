@@ -310,7 +310,7 @@ class TestSmartRoutingInCalls:
 
         captured_model = None
 
-        async def _capture_spawn(prompt: str, model: str) -> tuple[str, str]:
+        async def _capture_spawn(prompt: str, model: str, **kwargs: Any) -> tuple[str, str]:
             nonlocal captured_model
             captured_model = model
             return _text_response("ok"), ""
@@ -326,7 +326,7 @@ class TestSmartRoutingInCalls:
 
         captured_model = None
 
-        async def _capture_spawn(prompt: str, model: str) -> tuple[str, str]:
+        async def _capture_spawn(prompt: str, model: str, **kwargs: Any) -> tuple[str, str]:
             nonlocal captured_model
             captured_model = model
             return _text_response("done"), ""

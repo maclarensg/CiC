@@ -2,9 +2,30 @@
 
 **Build your own personal AI agent using the Claude Code CLI as a subprocess.**
 
-CiC lets you use `claude` as the brain of your agent while you control the body. Claude handles file operations itself using its built-in tools. You define the custom tools (update databases, call APIs, move kanban cards — anything that Claude can't do natively). Claude decides when to call them. Your code executes them. That's it.
+CiC lets you use `claude` as the brain of your agent while you control the body. You define the tools. Claude decides which ones to call. Your code executes them. That's it.
+
+Two modes let you choose how much control to keep:
+- **Hybrid mode** (default) — Claude edits files itself, you only execute custom tools
+- **Non-hybrid mode** — Claude decides every action, you execute everything (including file ops)
 
 No SDK lock-in. No framework to learn. Just a subprocess, structured output, and your agent logic.
+
+---
+
+## Hybrid vs Non-Hybrid Mode
+
+| | Hybrid (default) | Non-Hybrid (`hybrid=False`) |
+|---|---|---|
+| Claude's built-in tools | Yes (Bash, Edit, Read, Write) | No tools |
+| File edits | Claude edits files directly | Caller executes every edit |
+| Actions per call | Many (Claude loops internally) | One action per call |
+| Caller executes | Custom tools only | ALL tools (file ops, shell, custom) |
+| Control | Less — Claude decides when to stop | Full — you verify every operation |
+| Round-trips | Fewer | More |
+
+**When to use hybrid:** You want Claude to handle file operations autonomously. Fewer lines of agent loop code. Less round-trip overhead.
+
+**When to use non-hybrid:** You want to verify or intercept every file change before it happens. Useful when you need an audit trail, want to run safety checks on edits, or are building a tool where user approval is required.
 
 ---
 
@@ -31,6 +52,102 @@ flowchart LR
 ```
 
 **The key insight:** Claude edits files ITSELF. Your code only executes custom tools (database updates, kanban moves, API calls — things Claude can't do natively). This eliminates the phantom edit bug.
+
+---
+
+## How Non-Hybrid Mode Works
+
+Non-hybrid mode gives you full control over every tool execution. Claude has no built-in tools — it outputs **one action per call** and the caller executes it.
+
+The breakthrough that makes this work: `--json-schema` with an action-enum schema forces Claude to output structured tool call decisions instead of narrative text. Every response is exactly one JSON object with `action`, `arguments`, and `reasoning`.
+
+```mermaid
+flowchart LR
+    A[Your Agent Code] -->|messages + all tools| B[CiCClient\nhybrid=False]
+    B -->|builds prompt + action-enum schema| C["claude --print\n--tools ''\n--json-schema schema\n--model sonnet"]
+    C -->|structured_output\n{action, arguments, reasoning}| B
+    B --> D{action?}
+    D -->|tool_call| E["result.tool_calls\n→ You execute the tool"]
+    D -->|done| F["result.content\n→ Task complete"]
+    D -->|blocked| G["result.content\n→ Blocked reason"]
+    E -->|result appended| A
+    A -->|next chat\| B
+
+    style B fill:#4a9eff,color:#fff
+    style C fill:#f59e0b,color:#fff
+    style E fill:#10b981,color:#fff
+    style F fill:#8b5cf6,color:#fff
+```
+
+```python
+from cic import CiCClient
+
+# Define ALL tools — Claude cannot call any of them directly
+tools = [
+    {
+        "name": "file_read",
+        "description": "Read a file from disk.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "file_edit",
+        "description": "Edit a file by replacing old_string with new_string.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        },
+    },
+    {
+        "name": "shell_exec",
+        "description": "Run a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+]
+
+client = CiCClient(model="sonnet", hybrid=False)
+messages = [{"role": "user", "content": "Fix the bug in main.py on line 42"}]
+
+while True:
+    result = client.chat(messages, tools=tools)
+
+    if not result.has_tool_calls:
+        # action was "done" or "blocked" — we're finished
+        print("Done:", result.content)
+        break
+
+    # Claude decided one action — YOU execute it
+    for tc in result.tool_calls:
+        if tc.name == "file_read":
+            output = open(tc.arguments["path"]).read()
+        elif tc.name == "file_edit":
+            # You can inspect or approve the edit before applying it
+            apply_edit(tc.arguments["path"], tc.arguments["old_string"], tc.arguments["new_string"])
+            output = "Edit applied"
+        elif tc.name == "shell_exec":
+            output = subprocess.check_output(tc.arguments["command"], shell=True, text=True)
+        else:
+            output = f"Unknown tool: {tc.name}"
+
+        messages.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": tc.arguments_json()}}
+        ]})
+        messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": output})
+```
+
+Each call returns exactly one action. The loop continues until Claude outputs `action: "done"` (no tool calls) or `action: "blocked"` (also no tool calls, with a reason in `result.content`).
 
 ---
 
@@ -349,6 +466,8 @@ CiCClient(
     routing: dict[str, str] | None = None,  # Complexity -> model map
     timeout: float = 120.0,                 # Subprocess timeout (seconds)
     claude_path: str | None = None,         # Path to claude binary
+    hybrid: bool = True,                    # True: Claude edits files directly
+                                            # False: caller executes every tool
 )
 ```
 
