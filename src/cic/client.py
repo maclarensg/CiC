@@ -361,8 +361,11 @@ class CiCClient:
     ) -> tuple[str, str]:
         """Spawn the claude CLI and return (stdout, stderr).
 
-        The prompt is piped to stdin. The CLI writes its JSON response to
-        stdout. stderr carries diagnostic output (not part of the response).
+        Uses ``--output-format stream-json --verbose`` to receive line-by-line
+        events as Claude works. An idle timer resets on each line received — the
+        process is only killed if no output arrives for ``self._timeout`` seconds.
+        This means Claude can run for as long as it needs on complex multi-step
+        work without a wall-clock limit; the guard only fires on genuine stalls.
 
         In hybrid mode: uses ``--tools Bash,Edit,Read,Write`` and the hybrid
         structured output schema (summary + files_modified + pending_tool_calls).
@@ -377,12 +380,16 @@ class CiCClient:
                 Ignored in hybrid mode.
 
         Returns:
-            A tuple of ``(stdout, stderr)`` as decoded strings.
+            A tuple of ``(stdout, stderr)`` as decoded strings. ``stdout`` is
+            the JSON line with ``"type": "result"`` from the stream (or the last
+            line if no explicit result event was received).
 
         Raises:
-            ClaudeTimeoutError: If the subprocess does not complete within
-                ``self._timeout`` seconds.
+            ClaudeTimeoutError: If no output is received for ``self._timeout``
+                seconds (idle timeout — not a wall-clock limit).
         """
+        idle_timeout = self._timeout
+
         if self._hybrid:
             tools_flag = "Bash,Edit,Read,Write"
             schema = STRUCTURED_OUTPUT_SCHEMA
@@ -395,7 +402,8 @@ class CiCClient:
         cmd = [
             self._claude_path,
             "--print",
-            "--output-format", "json",
+            "--output-format", "stream-json",
+            "--verbose",  # required for stream-json
             "--tools", tools_flag,
             "--json-schema", schema,
             "--no-session-persistence",
@@ -423,18 +431,102 @@ class CiCClient:
             env=env,
         )
 
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode("utf-8")),
-                timeout=self._timeout,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            raise ClaudeTimeoutError(self._timeout) from None
+        # Send prompt to stdin and close it so the subprocess can start reading.
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
 
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        # Read stdout line-by-line with idle timeout.
+        # Each line received resets the timer. Only kill if truly idle.
+        lines: list[str] = []
+        result_line: str = ""
+        event_count = 0
+
+        try:
+            while True:
+                try:
+                    line_bytes = await asyncio.wait_for(
+                        proc.stdout.readline(),
+                        timeout=idle_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    # No output for idle_timeout seconds — Claude is stalled.
+                    logger.warning(
+                        "[CiC] Idle timeout (%ds no output, %d events received) — killing",
+                        idle_timeout,
+                        event_count,
+                    )
+                    proc.kill()
+                    await proc.communicate()
+                    raise ClaudeTimeoutError(idle_timeout) from None
+
+                if not line_bytes:
+                    # EOF — subprocess finished.
+                    break
+
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+
+                lines.append(line)
+                event_count += 1
+
+                # Parse each line to identify event type for logging and result extraction.
+                try:
+                    event = json.loads(line)
+                    etype = event.get("type", "")
+                    if etype == "result":
+                        result_line = line
+                        logger.debug("[CiC] Stream: result event (final)")
+                    elif etype == "assistant":
+                        # Log tool_use events for operational visibility.
+                        msg = event.get("message", {})
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            for block in content:
+                                if (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "tool_use"
+                                ):
+                                    logger.info(
+                                        "[CiC] Stream: tool_use %s",
+                                        block.get("name", "?"),
+                                    )
+                except json.JSONDecodeError:
+                    pass  # Not every line is valid JSON (e.g. debug output)
+
+        finally:
+            # Ensure the process is cleaned up even if we break out early.
+            if proc.returncode is None:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+
+        # Collect any remaining stderr.
+        stderr = ""
+        if proc.stderr:
+            try:
+                stderr_bytes = await asyncio.wait_for(proc.stderr.read(), timeout=5)
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+        logger.info(
+            "[CiC] Stream complete: %d events, result=%s",
+            event_count,
+            bool(result_line),
+        )
+
+        # The result line is the type:"result" event — the final structured output.
+        # Fall back to the last line received if no explicit result event was emitted.
+        if result_line:
+            stdout = result_line
+        elif lines:
+            stdout = lines[-1]
+        else:
+            stdout = ""
+
         return stdout, stderr
 
     # ------------------------------------------------------------------

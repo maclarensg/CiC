@@ -429,7 +429,9 @@ def parse_cli_output(stdout: str, *, hybrid: bool = True) -> dict[str, Any]:
     Non-hybrid mode: the CLI envelope contains a ``structured_output`` field with
     ``action``, ``arguments``, and ``reasoning`` (the action-enum schema).
 
-    The claude CLI with ``--output-format json`` returns an envelope like::
+    The claude CLI emits a stream of JSON lines with ``--output-format stream-json``.
+    The final line has ``"type": "result"`` and carries the same envelope structure
+    as the legacy ``--output-format json`` single-response mode::
 
         {
             "type": "result",
@@ -438,6 +440,10 @@ def parse_cli_output(stdout: str, *, hybrid: bool = True) -> dict[str, Any]:
             "is_error": false,
             ...
         }
+
+    The caller (``_spawn_claude``) extracts only the ``type: "result"`` line and
+    passes it here, so this function always receives a single JSON line regardless
+    of output format.
 
     Args:
         stdout: Raw stdout from the claude subprocess.

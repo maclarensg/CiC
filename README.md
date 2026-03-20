@@ -310,6 +310,7 @@ Each call is a **fresh subprocess** — no state leaks between calls. Your agent
 **CiC handles several sharp edges automatically:**
 
 - **File edits happen in the subprocess.** No phantom edits. Files change before structured output is returned.
+- **Idle timeout, not wall timeout** — CiC uses `--output-format stream-json` and reads stdout line-by-line. The `timeout` parameter is an *idle* timeout: the process is only killed if no output is received for that many seconds. Claude can run multi-step tasks as long as it keeps producing output (tool calls, edits, thinking). The guard only fires on genuine stalls.
 - **Context bloat prevention** — `--setting-sources user` + `--system-prompt` reduces cache creation from ~45K to ~3K tokens per call (13x reduction).
 - **MCP isolation** — `--strict-mcp-config` strips all MCP tools (e.g. Google Calendar) that would confuse the model.
 - **Nesting safety** — Strips `CLAUDECODE` and `CLAUDE_CODE_ENTRY_POINT` env vars so CiC works even when called from inside a Claude Code session (hooks, skills, agent-in-agent).

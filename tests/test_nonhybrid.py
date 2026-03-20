@@ -62,6 +62,36 @@ def _mock_spawn(stdout: str, stderr: str = "") -> AsyncMock:
     return mock
 
 
+def _make_stream_proc(response_line: str, stderr: bytes = b"") -> MagicMock:
+    """Build a mock asyncio subprocess that simulates stream-json output.
+
+    Emits ``response_line`` as the single stdout line (the type:"result" event),
+    then EOF. ``stdin`` supports write/drain/close.
+    """
+    proc = MagicMock()
+    proc.returncode = 0
+
+    stdin = MagicMock()
+    stdin.write = MagicMock()
+    stdin.drain = AsyncMock()
+    stdin.close = MagicMock()
+    proc.stdin = stdin
+
+    _responses = iter([response_line.encode("utf-8") + b"\n", b""])
+    stdout = MagicMock()
+    stdout.readline = AsyncMock(side_effect=lambda: next(_responses))
+    proc.stdout = stdout
+
+    stderr_mock = MagicMock()
+    stderr_mock.read = AsyncMock(return_value=stderr)
+    proc.stderr = stderr_mock
+
+    proc.wait = AsyncMock()
+    proc.kill = MagicMock()
+    proc.communicate = AsyncMock(return_value=(b"", stderr))
+    return proc
+
+
 # ---------------------------------------------------------------------------
 # TestNonHybridSchema — build_non_hybrid_schema
 # ---------------------------------------------------------------------------
@@ -394,12 +424,7 @@ class TestNonHybridClientSubprocess:
 
         async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
             captured_cmd.extend(args)
-            proc = MagicMock()
-            proc.communicate = AsyncMock(
-                return_value=(_non_hybrid_envelope("done").encode(), b"")
-            )
-            proc.kill = MagicMock()
-            return proc
+            return _make_stream_proc(_non_hybrid_envelope("done"))
 
         with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec):
             await client.achat([{"role": "user", "content": "hi"}])
@@ -414,26 +439,20 @@ class TestNonHybridClientSubprocess:
         client = _make_client(model="sonnet", hybrid=True)
         captured_cmd: list[str] = []
 
+        hybrid_response = json.dumps({
+            "type": "result",
+            "result": "",
+            "is_error": False,
+            "structured_output": {
+                "summary": "ok",
+                "files_modified": [],
+                "pending_tool_calls": [],
+            },
+        })
+
         async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
             captured_cmd.extend(args)
-            proc = MagicMock()
-            proc.communicate = AsyncMock(
-                return_value=(
-                    json.dumps({
-                        "type": "result",
-                        "result": "",
-                        "is_error": False,
-                        "structured_output": {
-                            "summary": "ok",
-                            "files_modified": [],
-                            "pending_tool_calls": [],
-                        },
-                    }).encode(),
-                    b"",
-                )
-            )
-            proc.kill = MagicMock()
-            return proc
+            return _make_stream_proc(hybrid_response)
 
         with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec):
             await client.achat([{"role": "user", "content": "hi"}])
@@ -450,12 +469,7 @@ class TestNonHybridClientSubprocess:
 
         async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
             captured_cmd.extend(args)
-            proc = MagicMock()
-            proc.communicate = AsyncMock(
-                return_value=(_non_hybrid_envelope("done").encode(), b"")
-            )
-            proc.kill = MagicMock()
-            return proc
+            return _make_stream_proc(_non_hybrid_envelope("done"))
 
         tools = [
             {"function": {"name": "file_read", "description": "R", "parameters": {}}},
@@ -481,12 +495,7 @@ class TestNonHybridClientSubprocess:
 
         async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
             captured_cmd.extend(args)
-            proc = MagicMock()
-            proc.communicate = AsyncMock(
-                return_value=(_non_hybrid_envelope("done").encode(), b"")
-            )
-            proc.kill = MagicMock()
-            return proc
+            return _make_stream_proc(_non_hybrid_envelope("done"))
 
         with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec):
             await client.achat([{"role": "user", "content": "hi"}])

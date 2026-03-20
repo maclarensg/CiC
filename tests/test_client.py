@@ -403,29 +403,52 @@ class TestParseArguments:
 # chat() event loop guard
 # ---------------------------------------------------------------------------
 
+def _make_stream_proc(response_line: str, stderr: bytes = b"") -> MagicMock:
+    """Build a mock asyncio subprocess that simulates stream-json output.
+
+    Emits ``response_line`` as the single stdout line (the type:"result" event),
+    then EOF. ``stdin`` supports write/drain/close. ``stderr.read()`` returns
+    ``stderr``.
+    """
+    proc = MagicMock()
+    proc.returncode = 0
+
+    # stdin mock — supports write/drain/close
+    stdin = MagicMock()
+    stdin.write = MagicMock()
+    stdin.drain = AsyncMock()
+    stdin.close = MagicMock()
+    proc.stdin = stdin
+
+    # stdout mock — readline returns line once, then EOF (b"")
+    stdout = MagicMock()
+    _responses = iter([response_line.encode("utf-8") + b"\n", b""])
+    stdout.readline = AsyncMock(side_effect=lambda: next(_responses))
+    proc.stdout = stdout
+
+    # stderr mock
+    stderr_mock = MagicMock()
+    stderr_mock.read = AsyncMock(return_value=stderr)
+    proc.stderr = stderr_mock
+
+    proc.wait = AsyncMock()
+    proc.kill = MagicMock()
+    proc.communicate = AsyncMock(return_value=(b"", stderr))
+    return proc
+
+
 class TestSubprocessEnvironment:
-    """Verify env sanitization in _spawn_claude."""
+    """Verify env sanitization and command flags in _spawn_claude."""
 
     @pytest.mark.asyncio
     async def test_claudecode_env_stripped(self):
         """CLAUDECODE env var must not leak into subprocess."""
         client = _make_client(model="sonnet")
-        captured_env = {}
-
-        real_spawn = asyncio.create_subprocess_exec
+        captured_env: dict[str, str] = {}
 
         async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
             captured_env.update(kwargs.get("env", {}))
-            # Return a mock process
-            proc = MagicMock()
-            proc.communicate = AsyncMock(
-                return_value=(
-                    _text_response("ok").encode(),
-                    b"",
-                )
-            )
-            proc.kill = MagicMock()
-            return proc
+            return _make_stream_proc(_text_response("ok"))
 
         import os
         old = os.environ.get("CLAUDECODE")
@@ -449,12 +472,7 @@ class TestSubprocessEnvironment:
 
         async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
             captured_cmd.extend(args)
-            proc = MagicMock()
-            proc.communicate = AsyncMock(
-                return_value=(_text_response("ok").encode(), b"")
-            )
-            proc.kill = MagicMock()
-            return proc
+            return _make_stream_proc(_text_response("ok"))
 
         with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec):
             await client.achat([{"role": "user", "content": "hi"}])
@@ -464,6 +482,24 @@ class TestSubprocessEnvironment:
         assert captured_cmd[idx + 1] == "user"
 
     @pytest.mark.asyncio
+    async def test_stream_json_flags_in_cmd(self):
+        """_spawn_claude must use --output-format stream-json --verbose."""
+        client = _make_client(model="sonnet")
+        captured_cmd: list[str] = []
+
+        async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
+            captured_cmd.extend(args)
+            return _make_stream_proc(_text_response("ok"))
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec):
+            await client.achat([{"role": "user", "content": "hi"}])
+
+        assert "--output-format" in captured_cmd
+        fmt_idx = captured_cmd.index("--output-format")
+        assert captured_cmd[fmt_idx + 1] == "stream-json"
+        assert "--verbose" in captured_cmd
+
+    @pytest.mark.asyncio
     async def test_hybrid_mode_flags_in_cmd(self):
         """Hybrid mode must use --tools Bash,Edit,Read,Write and --json-schema."""
         client = _make_client(model="sonnet")
@@ -471,12 +507,7 @@ class TestSubprocessEnvironment:
 
         async def _capture_exec(*args: Any, **kwargs: Any) -> Any:
             captured_cmd.extend(args)
-            proc = MagicMock()
-            proc.communicate = AsyncMock(
-                return_value=(_text_response("ok").encode(), b"")
-            )
-            proc.kill = MagicMock()
-            return proc
+            return _make_stream_proc(_text_response("ok"))
 
         with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec):
             await client.achat([{"role": "user", "content": "hi"}])
@@ -485,6 +516,156 @@ class TestSubprocessEnvironment:
         tools_idx = captured_cmd.index("--tools")
         assert captured_cmd[tools_idx + 1] == "Bash,Edit,Read,Write"
         assert "--json-schema" in captured_cmd
+
+
+# ---------------------------------------------------------------------------
+# Idle timeout behaviour
+# ---------------------------------------------------------------------------
+
+class TestIdleTimeout:
+    """Verify that _spawn_claude raises ClaudeTimeoutError on idle stall."""
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_raises(self):
+        """When readline stalls, ClaudeTimeoutError must be raised."""
+        client = _make_client(model="sonnet", timeout=0.05)
+
+        async def _stall_exec(*args: Any, **kwargs: Any) -> Any:
+            proc = MagicMock()
+            proc.returncode = None
+
+            stdin = MagicMock()
+            stdin.write = MagicMock()
+            stdin.drain = AsyncMock()
+            stdin.close = MagicMock()
+            proc.stdin = stdin
+
+            async def _never_return() -> bytes:
+                await asyncio.sleep(10)
+                return b""
+
+            stdout = MagicMock()
+            stdout.readline = AsyncMock(side_effect=_never_return)
+            proc.stdout = stdout
+
+            proc.kill = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.wait = AsyncMock()
+
+            stderr_mock = MagicMock()
+            stderr_mock.read = AsyncMock(return_value=b"")
+            proc.stderr = stderr_mock
+
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_stall_exec):
+            with pytest.raises(ClaudeTimeoutError) as exc_info:
+                await client._spawn_claude("prompt", "sonnet")
+
+        assert exc_info.value.timeout == pytest.approx(0.05, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_reset_per_line(self):
+        """Each received line resets the idle timer — slow-but-active work completes."""
+        client = _make_client(model="sonnet", timeout=0.2)
+
+        # Stream two non-result lines with a 0.1s gap each, then the result line.
+        # Total wall time ~0.2s but each individual gap is < 0.2s — must not timeout.
+        result_json = _text_response("success")
+
+        async def _slow_stream_exec(*args: Any, **kwargs: Any) -> Any:
+            proc = MagicMock()
+            proc.returncode = 0
+
+            stdin = MagicMock()
+            stdin.write = MagicMock()
+            stdin.drain = AsyncMock()
+            stdin.close = MagicMock()
+            proc.stdin = stdin
+
+            lines_to_emit = [
+                json.dumps({"type": "system", "subtype": "init"}).encode() + b"\n",
+                json.dumps({"type": "assistant", "message": {}}).encode() + b"\n",
+                result_json.encode() + b"\n",
+                b"",  # EOF
+            ]
+            call_count = 0
+
+            async def _readline() -> bytes:
+                nonlocal call_count
+                await asyncio.sleep(0.08)  # 80ms gap — well under 200ms idle timeout
+                result = lines_to_emit[call_count]
+                call_count += 1
+                return result
+
+            stdout = MagicMock()
+            stdout.readline = AsyncMock(side_effect=_readline)
+            proc.stdout = stdout
+
+            proc.kill = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.wait = AsyncMock()
+
+            stderr_mock = MagicMock()
+            stderr_mock.read = AsyncMock(return_value=b"")
+            proc.stderr = stderr_mock
+
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_slow_stream_exec):
+            stdout, _ = await client._spawn_claude("prompt", "sonnet")
+
+        assert stdout == result_json
+
+    @pytest.mark.asyncio
+    async def test_result_line_extracted_from_stream(self):
+        """The type:'result' line is returned as stdout, not the full stream."""
+        client = _make_client(model="sonnet")
+
+        result_json = _text_response("extracted correctly")
+        other_line = json.dumps({"type": "system", "subtype": "init"})
+
+        async def _multi_line_exec(*args: Any, **kwargs: Any) -> Any:
+            lines = [
+                other_line.encode() + b"\n",
+                result_json.encode() + b"\n",
+                b"",
+            ]
+            idx = 0
+
+            proc = MagicMock()
+            proc.returncode = 0
+
+            stdin = MagicMock()
+            stdin.write = MagicMock()
+            stdin.drain = AsyncMock()
+            stdin.close = MagicMock()
+            proc.stdin = stdin
+
+            async def _readline() -> bytes:
+                nonlocal idx
+                val = lines[idx]
+                idx += 1
+                return val
+
+            stdout = MagicMock()
+            stdout.readline = AsyncMock(side_effect=_readline)
+            proc.stdout = stdout
+
+            proc.kill = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.wait = AsyncMock()
+
+            stderr_mock = MagicMock()
+            stderr_mock.read = AsyncMock(return_value=b"")
+            proc.stderr = stderr_mock
+
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_multi_line_exec):
+            stdout, _ = await client._spawn_claude("prompt", "sonnet")
+
+        assert stdout == result_json
 
 
 class TestSyncChatEventLoopGuard:
